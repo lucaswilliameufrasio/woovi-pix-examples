@@ -46,6 +46,7 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM simulated_charges WHERE order_id IN (SELECT id FROM orders WHERE offer_id=$1)`, offerID)
 		_, _ = pool.Exec(context.Background(), `DELETE FROM payment_events WHERE order_id IN (SELECT id FROM orders WHERE offer_id=$1)`, offerID)
 		_, _ = pool.Exec(context.Background(), `DELETE FROM orders WHERE offer_id=$1`, offerID)
 		_, _ = pool.Exec(context.Background(), `DELETE FROM offers WHERE id=$1`, offerID)
@@ -77,7 +78,7 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 		}
 		return nil
 	}
-	sim := httptest.NewServer(New(lookup, deliver).Handler())
+	sim := httptest.NewServer(New(st, lookup, deliver).Handler())
 	defer sim.Close()
 	chargeBody, _ := json.Marshal(map[string]string{"order_id": order.ID})
 	resp, err := client.Post(sim.URL+"/charges", "application/json", bytes.NewReader(chargeBody))
@@ -91,6 +92,22 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || charge.AmountCents != 1999 {
 		t.Fatalf("charge=%+v status=%d", charge, resp.StatusCode)
+	}
+	sim.Close()
+	// A fresh simulator process reads the same durable charge from PostgreSQL.
+	sim = httptest.NewServer(New(st, lookup, deliver).Handler())
+	defer sim.Close()
+	resp, err = client.Get(sim.URL + "/charges/" + order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recovered Charge
+	if err := json.NewDecoder(resp.Body).Decode(&recovered); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || recovered.ID != charge.ID || recovered.AmountCents != charge.AmountCents {
+		t.Fatalf("recovered charge=%+v status=%d", recovered, resp.StatusCode)
 	}
 	resp, err = client.Post(sim.URL+"/charges/"+order.ID+"/pay", "application/json", nil)
 	if err != nil {

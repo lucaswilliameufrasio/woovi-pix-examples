@@ -29,6 +29,7 @@ func integrationStore(t *testing.T) *Store {
 	}
 	offerID := testID(t)
 	t.Cleanup(func() {
+		_, _ = s.pool.Exec(context.Background(), `DELETE FROM simulated_charges WHERE order_id IN (SELECT id FROM orders WHERE offer_id=$1)`, offerID)
 		_, _ = s.pool.Exec(context.Background(), `DELETE FROM payment_events WHERE order_id IN (SELECT id FROM orders WHERE offer_id=$1)`, offerID)
 		_, _ = s.pool.Exec(context.Background(), `DELETE FROM orders WHERE offer_id=$1`, offerID)
 		_, _ = s.pool.Exec(context.Background(), `UPDATE offers SET available_units=total_units WHERE id=$1`, offerID)
@@ -480,5 +481,47 @@ func TestOneTransientEventFailureDoesNotBlockBatch(t *testing.T) {
 	}
 	if firstState.State != "paid" {
 		t.Fatalf("retried first order state=%s", firstState.State)
+	}
+}
+
+func TestSimulatedChargeIsDurableAndIdempotentUnderConcurrency(t *testing.T) {
+	s := integrationStore(t)
+	order, err := s.CreateOrder(context.Background(), offerID(t)+"-charge", offerID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const clients = 20
+	start := make(chan struct{})
+	results := make(chan SimulatedCharge, clients)
+	errs := make(chan error, clients)
+	for i := 0; i < clients; i++ {
+		go func() {
+			<-start
+			charge, err := s.CreateSimulatedCharge(context.Background(), order.ID, order.Amount)
+			results <- charge
+			errs <- err
+		}()
+	}
+	close(start)
+	var chargeID string
+	for i := 0; i < clients; i++ {
+		charge := <-results
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+		if charge.AmountCents != order.Amount || charge.Status != "pending" {
+			t.Fatalf("charge=%+v", charge)
+		}
+		if chargeID == "" {
+			chargeID = charge.ID
+		} else if charge.ID != chargeID {
+			t.Fatalf("non-idempotent charge IDs %q and %q", chargeID, charge.ID)
+		}
+	}
+	if charge, err := s.GetSimulatedCharge(context.Background(), order.ID); err != nil || charge.ID != chargeID {
+		t.Fatalf("durable charge=%+v err=%v", charge, err)
+	}
+	if _, err := s.CreateSimulatedCharge(context.Background(), order.ID, order.Amount+1); !errors.Is(err, ErrChargeConflict) {
+		t.Fatalf("expected amount conflict, got %v", err)
 	}
 }

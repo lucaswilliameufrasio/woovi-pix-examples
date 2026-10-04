@@ -89,7 +89,7 @@ func main() {
 }
 
 func simulatorHandler(st *store.Store) http.Handler {
-	base := simulator.New(func(orderID string) (int64, error) {
+	base := simulator.New(st, func(orderID string) (int64, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		o, err := st.GetOrder(ctx, orderID)

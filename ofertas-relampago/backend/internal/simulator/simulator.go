@@ -2,10 +2,13 @@ package simulator
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
-	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/lucaseufrasio/woovi-pix-examples/ofertas-relampago/backend/internal/store"
 )
 
 type Charge struct {
@@ -15,14 +18,13 @@ type Charge struct {
 	Status      string `json:"status"`
 }
 type Server struct {
-	mu      sync.Mutex
-	charges map[string]Charge
+	store   *store.Store
 	lookup  func(string) (int64, error)
 	deliver func(string, string) error
 }
 
-func New(lookup func(string) (int64, error), deliver func(string, string) error) *Server {
-	return &Server{charges: make(map[string]Charge), lookup: lookup, deliver: deliver}
+func New(st *store.Store, lookup func(string) (int64, error), deliver func(string, string) error) *Server {
+	return &Server{store: st, lookup: lookup, deliver: deliver}
 }
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -47,31 +49,30 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "order not found", 404)
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	c, ok := s.charges[in.OrderID]
-	if !ok {
-		c = Charge{ID: "sim-" + in.OrderID, OrderID: in.OrderID, AmountCents: amount, Status: "pending"}
-		s.charges[in.OrderID] = c
-	} else if c.AmountCents != amount {
+	saved, err := s.store.CreateSimulatedCharge(r.Context(), in.OrderID, amount)
+	if errors.Is(err, store.ErrChargeConflict) {
 		http.Error(w, "idempotency conflict", http.StatusConflict)
 		return
 	}
+	if err != nil {
+		http.Error(w, "charge persistence failed", http.StatusInternalServerError)
+		return
+	}
+	c := Charge{ID: saved.ID, OrderID: saved.OrderID, AmountCents: saved.AmountCents, Status: saved.Status}
 	write(w, c)
 }
 func (s *Server) pay(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	c, ok := s.charges[r.PathValue("orderID")]
-	if ok {
-		c.Status = "paid"
-		s.charges[c.OrderID] = c
-	}
-	s.mu.Unlock()
-	if !ok {
+	orderID := r.PathValue("orderID")
+	charge, err := s.store.MarkSimulatedChargePaid(r.Context(), orderID)
+	if errors.Is(err, pgx.ErrNoRows) {
 		http.Error(w, "not found", 404)
 		return
 	}
-	if s.deliver == nil || s.deliver(c.OrderID, "paid:"+c.OrderID) != nil {
+	if err != nil {
+		http.Error(w, "charge persistence failed", http.StatusInternalServerError)
+		return
+	}
+	if s.deliver == nil || s.deliver(charge.OrderID, "paid:"+charge.OrderID) != nil {
 		http.Error(w, "delivery failed", http.StatusBadGateway)
 		return
 	}
@@ -85,13 +86,16 @@ func (s *Server) latePay(w http.ResponseWriter, r *http.Request) {
 	write(w, map[string]any{"status": "late webhook accepted", "at": time.Now().UTC()})
 }
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	c, ok := s.charges[r.PathValue("orderID")]
-	if !ok {
+	saved, err := s.store.GetSimulatedCharge(r.Context(), r.PathValue("orderID"))
+	if errors.Is(err, pgx.ErrNoRows) {
 		http.Error(w, "not found", 404)
 		return
 	}
+	if err != nil {
+		http.Error(w, "charge lookup failed", http.StatusInternalServerError)
+		return
+	}
+	c := Charge{ID: saved.ID, OrderID: saved.OrderID, AmountCents: saved.AmountCents, Status: saved.Status}
 	write(w, c)
 }
 func (s *Server) scenario(w http.ResponseWriter, r *http.Request) {

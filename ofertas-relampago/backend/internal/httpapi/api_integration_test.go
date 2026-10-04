@@ -41,6 +41,7 @@ func TestOrderRoutesAgainstPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM simulated_charges WHERE order_id IN (SELECT id FROM orders WHERE offer_id=$1)`, offerID)
 		_, _ = pool.Exec(context.Background(), `DELETE FROM payment_events WHERE order_id IN (SELECT id FROM orders WHERE offer_id=$1)`, offerID)
 	}()
 	defer func() { _, _ = pool.Exec(context.Background(), `DELETE FROM orders WHERE offer_id=$1`, offerID) }()

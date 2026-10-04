@@ -32,3 +32,12 @@ CREATE TABLE payment_events (
 );
 
 CREATE INDEX payment_events_pending_idx ON payment_events(received_at) WHERE processed_at IS NULL;
+
+CREATE TABLE simulated_charges (
+    order_id text PRIMARY KEY REFERENCES orders(id),
+    charge_id text NOT NULL UNIQUE,
+    amount_cents bigint NOT NULL CHECK (amount_cents > 0),
+    status text NOT NULL CHECK (status IN ('pending', 'paid')),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);

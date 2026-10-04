@@ -12,6 +12,7 @@ import (
 
 var ErrUnavailable = errors.New("offer unavailable")
 var ErrEventKeyConflict = errors.New("event key already belongs to another order")
+var ErrChargeConflict = errors.New("charge order already has a different amount")
 
 type Offer struct {
 	ID                   string `json:"id"`
@@ -27,6 +28,13 @@ type Order struct {
 	Amount    int64     `json:"amount_cents"`
 	State     string    `json:"state"`
 	ExpiresAt time.Time `json:"expires_at"`
+}
+
+type SimulatedCharge struct {
+	ID          string `json:"id"`
+	OrderID     string `json:"order_id"`
+	AmountCents int64  `json:"amount_cents"`
+	Status      string `json:"status"`
 }
 
 type Store struct{ pool *pgxpool.Pool }
@@ -56,6 +64,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 		CREATE INDEX IF NOT EXISTS orders_expiring_idx ON orders(expires_at) WHERE state='pending_payment';
 		CREATE TABLE IF NOT EXISTS payment_events(id text PRIMARY KEY,order_id text NOT NULL REFERENCES orders(id),event_type text NOT NULL CHECK(event_type='paid'),event_key text NOT NULL UNIQUE,received_at timestamptz NOT NULL DEFAULT now(),processed_at timestamptz,lease_until timestamptz,attempts integer NOT NULL DEFAULT 0,last_error text);
 		CREATE INDEX IF NOT EXISTS payment_events_pending_idx ON payment_events(received_at) WHERE processed_at IS NULL;`
+	const simulatedChargesSchema = `CREATE TABLE IF NOT EXISTS simulated_charges(order_id text PRIMARY KEY REFERENCES orders(id),charge_id text NOT NULL UNIQUE,amount_cents bigint NOT NULL CHECK(amount_cents>0),status text NOT NULL CHECK(status IN ('pending','paid')),created_at timestamptz NOT NULL DEFAULT now(),updated_at timestamptz NOT NULL DEFAULT now());`
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin schema migration: %w", err)
@@ -67,6 +76,10 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := tx.Exec(ctx, schema); err != nil {
 		_ = tx.Rollback(ctx)
 		return fmt.Errorf("migrate schema: %w", err)
+	}
+	if _, err := tx.Exec(ctx, simulatedChargesSchema); err != nil {
+		_ = tx.Rollback(ctx)
+		return fmt.Errorf("migrate simulated charges: %w", err)
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO offers(id,title,price_cents,total_units,available_units,reservation_ttl_seconds)
 		VALUES ('demo-offer','Sacola surpresa — demonstração local',2500,1,1,120) ON CONFLICT(id) DO NOTHING`)
@@ -238,6 +251,9 @@ func (s *Store) ResetDemo(ctx context.Context) error {
 	if _, err := tx.Exec(ctx, `DELETE FROM payment_events`); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(ctx, `DELETE FROM simulated_charges`); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM orders`); err != nil {
 		return err
 	}
@@ -266,6 +282,33 @@ func (s *Store) PersistPaidEvent(ctx context.Context, id, orderID, eventKey stri
 		return false, err
 	}
 	return created, nil
+}
+
+func (s *Store) CreateSimulatedCharge(ctx context.Context, orderID string, amount int64) (SimulatedCharge, error) {
+	chargeID := "sim-" + orderID
+	if _, err := s.pool.Exec(ctx, `INSERT INTO simulated_charges(order_id,charge_id,amount_cents,status) VALUES($1,$2,$3,'pending') ON CONFLICT(order_id) DO NOTHING`, orderID, chargeID, amount); err != nil {
+		return SimulatedCharge{}, err
+	}
+	charge, err := s.GetSimulatedCharge(ctx, orderID)
+	if err != nil {
+		return SimulatedCharge{}, err
+	}
+	if charge.AmountCents != amount {
+		return SimulatedCharge{}, ErrChargeConflict
+	}
+	return charge, nil
+}
+
+func (s *Store) GetSimulatedCharge(ctx context.Context, orderID string) (SimulatedCharge, error) {
+	var c SimulatedCharge
+	err := s.pool.QueryRow(ctx, `SELECT charge_id,order_id,amount_cents,status FROM simulated_charges WHERE order_id=$1`, orderID).Scan(&c.ID, &c.OrderID, &c.AmountCents, &c.Status)
+	return c, err
+}
+
+func (s *Store) MarkSimulatedChargePaid(ctx context.Context, orderID string) (SimulatedCharge, error) {
+	var c SimulatedCharge
+	err := s.pool.QueryRow(ctx, `UPDATE simulated_charges SET status='paid',updated_at=now() WHERE order_id=$1 RETURNING charge_id,order_id,amount_cents,status`, orderID).Scan(&c.ID, &c.OrderID, &c.AmountCents, &c.Status)
+	return c, err
 }
 
 func (s *Store) ProcessPaymentEvents(ctx context.Context, limit int) (int, error) {

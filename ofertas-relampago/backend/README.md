@@ -35,7 +35,7 @@ curl -s http://127.0.0.1:8080/orders/ORDER_ID
 curl -s http://127.0.0.1:8080/operator/orders
 ```
 
-Simulator `/charges` deriva o valor do pedido pelo backend e é idempotente por `order_id`. `pay` envia evento pago ao endpoint local; o backend persiste e deduplica o evento antes do HTTP 202 e um worker processa o evento. O worker reserva eventos com lease durável, recupera leases vencidos e agenda retry exponencial limitado para falhas transitórias. Há também um job periódico de expiração. Para exercitar webhook duplicado, repetir `POST /dev/webhooks/paid` com o mesmo `event_key`; reusar a chave em outro pedido conflita. `POST /dev/webhooks/{orderID}/late-paid` simula notificação tardia. Os eventos `/dev/scenarios` e `/dev/webhooks` só estão disponíveis com `DEMO_MODE=true`.
+Simulator `/charges` deriva o valor do pedido pelo backend e persiste a cobrança no PostgreSQL; é idempotente por `order_id`, inclusive após reinício. `pay` atualiza o status e envia evento pago ao endpoint local; o backend persiste e deduplica o evento antes do HTTP 202 e um worker processa o evento. O worker reserva eventos com lease durável, recupera leases vencidos e agenda retry exponencial limitado para falhas transitórias. Há também um job periódico de expiração. Para exercitar webhook duplicado, repetir `POST /dev/webhooks/paid` com o mesmo `event_key`; reusar a chave em outro pedido conflita. `POST /dev/webhooks/{orderID}/late-paid` simula notificação tardia. Os eventos `/dev/scenarios` e `/dev/webhooks` só estão disponíveis com `DEMO_MODE=true`.
 
 ## Testes
 
@@ -52,4 +52,4 @@ Testes de integração criam IDs únicos e limpam somente seus registros. O test
 
 ## Limites desta fatia
 
-Ainda não implementados: autenticação de operador/retirada, assinatura/autenticidade de webhook PSP, retry/backoff de falhas do worker, timeout incerto reconciliável e integração com Woovi/SDK/MCP. O simulador em memória não persiste cobranças entre reinícios. Não é uma integração de pagamentos pronta para produção. O simulador inclui cenários básicos para timeout/rate limit/atraso, mas timeout pós-criação ainda não reconcilia por referência e permanece pendente.
+Ainda não implementados: autenticação de operador/retirada, assinatura/autenticidade de webhook PSP, timeout incerto reconciliável e integração com Woovi/SDK/MCP. O simulador persiste cobranças sintéticas no banco local e não é um adapter PSP real. Não é uma integração de pagamentos pronta para produção. O simulador inclui cenários básicos para timeout/rate limit/atraso, mas timeout pós-criação ainda não reconcilia por referência e permanece pendente.
