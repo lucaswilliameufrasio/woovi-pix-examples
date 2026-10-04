@@ -1,0 +1,223 @@
+package store
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"os"
+	"sync"
+	"testing"
+)
+
+func integrationStore(t *testing.T) *Store {
+	t.Helper()
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL is required for PostgreSQL integration tests")
+	}
+	ctx := context.Background()
+	s, err := Open(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockID := int64(421337)
+	if _, err := s.pool.Exec(ctx, `SELECT pg_advisory_lock($1)`, lockID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = s.pool.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, lockID) })
+	t.Cleanup(s.Close)
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	offerID := testID(t)
+	t.Cleanup(func() {
+		_, _ = s.pool.Exec(context.Background(), `DELETE FROM orders WHERE offer_id=$1`, offerID)
+		_, _ = s.pool.Exec(context.Background(), `UPDATE offers SET available_units=total_units WHERE id=$1`, offerID)
+		_, _ = s.pool.Exec(context.Background(), `DELETE FROM offers WHERE id=$1`, offerID)
+	})
+	if _, err := s.pool.Exec(ctx, `INSERT INTO offers(id,title,price_cents,total_units,available_units,reservation_ttl_seconds) VALUES($1,'Integration offer',2500,1,1,120)`, offerID); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_OFFER_ID", offerID)
+	return s
+}
+
+func testID(t *testing.T) string {
+	t.Helper()
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatal(err)
+	}
+	return "test-" + hex.EncodeToString(b[:])
+}
+
+func offerID(t *testing.T) string { t.Helper(); return os.Getenv("TEST_OFFER_ID") }
+
+func TestConcurrentLastUnitOnlyCreatesOneOrder(t *testing.T) {
+	s := integrationStore(t)
+	const clients = 24
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	success, unavailable := 0, 0
+	errs := make([]error, 0)
+	for i := 0; i < clients; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, err := s.CreateOrder(context.Background(), offerID(t)+"-race-"+testID(t), offerID(t))
+			mu.Lock()
+			defer mu.Unlock()
+			switch err {
+			case nil:
+				success++
+			case ErrUnavailable:
+				unavailable++
+			default:
+				errs = append(errs, err)
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if success != 1 || unavailable != clients-1 {
+		t.Fatalf("success=%d unavailable=%d", success, unavailable)
+	}
+	var count, units int
+	if err := s.pool.QueryRow(context.Background(), `SELECT (SELECT count(*) FROM orders WHERE offer_id=$1),(SELECT available_units FROM offers WHERE id=$1)`, offerID(t)).Scan(&count, &units); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || units != 0 {
+		t.Fatalf("orders=%d available=%d", count, units)
+	}
+}
+
+func TestExpiryReleasesOnceAndLatePaymentIsException(t *testing.T) {
+	s := integrationStore(t)
+	order, err := s.CreateOrder(context.Background(), offerID(t)+"-expire", offerID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(context.Background(), `UPDATE orders SET expires_at=now()-interval '1 second' WHERE id=$1`, order.ID); err != nil {
+		t.Fatal(err)
+	}
+	count, err := s.ExpireOrders(context.Background())
+	if err != nil || count < 1 {
+		t.Fatalf("expired count=%d err=%v", count, err)
+	}
+	count, err = s.ExpireOrders(context.Background())
+	if err != nil {
+		t.Fatalf("second expiration count=%d err=%v", count, err)
+	}
+	var units int
+	if err := s.pool.QueryRow(context.Background(), `SELECT available_units FROM offers WHERE id=$1`, offerID(t)).Scan(&units); err != nil {
+		t.Fatal(err)
+	}
+	if units != 1 {
+		t.Fatalf("available=%d", units)
+	}
+	paid, err := s.MarkPaid(context.Background(), order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paid.State != "payment_exception" {
+		t.Fatalf("late payment state=%q", paid.State)
+	}
+}
+
+func TestLatePaymentWhenPendingReleasesReservedStockAtomically(t *testing.T) {
+	s := integrationStore(t)
+	order, err := s.CreateOrder(context.Background(), offerID(t)+"-late-pending", offerID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(context.Background(), `UPDATE orders SET expires_at=now()-interval '1 second' WHERE id=$1`, order.ID); err != nil {
+		t.Fatal(err)
+	}
+	paid, err := s.MarkPaid(context.Background(), order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paid.State != "payment_exception" {
+		t.Fatalf("late state=%s", paid.State)
+	}
+	var units int
+	if err := s.pool.QueryRow(context.Background(), `SELECT available_units FROM offers WHERE id=$1`, offerID(t)).Scan(&units); err != nil {
+		t.Fatal(err)
+	}
+	if units != 1 {
+		t.Fatalf("late payment left available units=%d", units)
+	}
+}
+
+func TestExpirationAndPaidRaceDoesNotLoseUnit(t *testing.T) {
+	s := integrationStore(t)
+	order, err := s.CreateOrder(context.Background(), offerID(t)+"-payment", offerID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(context.Background(), `UPDATE orders SET expires_at=now()-interval '1 second' WHERE id=$1`, order.ID); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var expireErr, payErr error
+	go func() { defer wg.Done(); <-start; _, expireErr = s.ExpireOrders(context.Background()) }()
+	go func() { defer wg.Done(); <-start; _, payErr = s.MarkPaid(context.Background(), order.ID) }()
+	close(start)
+	wg.Wait()
+	if expireErr != nil {
+		t.Fatal(expireErr)
+	}
+	if payErr != nil {
+		t.Fatal(payErr)
+	}
+	var state string
+	var units int
+	if err := s.pool.QueryRow(context.Background(), `SELECT (SELECT state FROM orders WHERE id=$1),(SELECT available_units FROM offers WHERE id=$2)`, order.ID, offerID(t)).Scan(&state, &units); err != nil {
+		t.Fatal(err)
+	}
+	if state != "payment_exception" || units != 1 {
+		t.Fatalf("state=%s units=%d", state, units)
+	}
+}
+
+func TestWebhookDedupAndWorkerProcessOnce(t *testing.T) {
+	s := integrationStore(t)
+	order, err := s.CreateOrder(context.Background(), offerID(t)+"-webhook", offerID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventKey := "event-unique-" + testID(t)
+	created, err := s.PersistPaidEvent(context.Background(), testID(t), order.ID, eventKey)
+	if err != nil || !created {
+		t.Fatalf("first event created=%v err=%v", created, err)
+	}
+	duplicate, err := s.PersistPaidEvent(context.Background(), testID(t), order.ID, eventKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicate {
+		t.Fatal("duplicate webhook event was inserted twice")
+	}
+	processed, err := s.ProcessPaymentEvents(context.Background(), 10)
+	if err != nil || processed != 1 {
+		t.Fatalf("processed=%d err=%v", processed, err)
+	}
+	processed, err = s.ProcessPaymentEvents(context.Background(), 10)
+	if err != nil || processed != 0 {
+		t.Fatalf("second worker processed=%d err=%v", processed, err)
+	}
+	paid, err := s.GetOrder(context.Background(), order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paid.State != "paid" {
+		t.Fatalf("order state=%s", paid.State)
+	}
+}
