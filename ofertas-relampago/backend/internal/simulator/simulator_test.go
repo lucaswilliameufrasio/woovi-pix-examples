@@ -164,6 +164,9 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 	if paidCharge.Status != "paid" {
 		t.Fatalf("charge after pay status=%s", paidCharge.Status)
 	}
+	if paidCharge.OrderState != "pending_payment" {
+		t.Fatalf("order state before worker=%s, want pending_payment", paidCharge.OrderState)
+	}
 	if _, err := st.ProcessPaymentEvents(ctx, 10); err != nil {
 		t.Fatal(err)
 	}
@@ -173,6 +176,18 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 	}
 	if paid.State != "paid" {
 		t.Fatalf("authoritative order state=%s", paid.State)
+	}
+	resp, err = client.Get(sim.URL + "/charges/" + order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reconciled Charge
+	if err := json.NewDecoder(resp.Body).Decode(&reconciled); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || reconciled.Status != "paid" || reconciled.OrderState != "paid" {
+		t.Fatalf("reconciled charge=%+v status=%d", reconciled, resp.StatusCode)
 	}
 }
 
@@ -286,11 +301,15 @@ func TestPayEndpointDoesNotClaimOperationalSuccessForLatePayment(t *testing.T) {
 		t.Fatalf("late pay status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	charge, err := st.GetSimulatedCharge(ctx, order.ID)
-	if err != nil || charge.Status != "paid" {
-		t.Fatalf("charge=%+v err=%v", charge, err)
+	if err != nil || charge.Status != "paid" || charge.OrderState != "expired" {
+		t.Fatalf("before worker charge=%+v err=%v", charge, err)
 	}
 	if _, err := st.ProcessPaymentEvents(ctx, 10); err != nil {
 		t.Fatal(err)
+	}
+	charge, err = st.GetSimulatedCharge(ctx, order.ID)
+	if err != nil || charge.Status != "paid" || charge.OrderState != "payment_exception" {
+		t.Fatalf("charge after late payment worker=%+v err=%v", charge, err)
 	}
 	final, err := st.GetOrder(ctx, order.ID)
 	if err != nil || final.State != "payment_exception" {

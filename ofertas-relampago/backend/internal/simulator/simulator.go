@@ -16,6 +16,7 @@ type Charge struct {
 	OrderID     string `json:"order_id"`
 	AmountCents int64  `json:"amount_cents"`
 	Status      string `json:"status"`
+	OrderState  string `json:"order_state"`
 }
 type Server struct {
 	store   *store.Store
@@ -74,7 +75,7 @@ func (s *Server) createCharge(w http.ResponseWriter, r *http.Request, orderID st
 		http.Error(w, "charge persistence failed", http.StatusInternalServerError)
 		return
 	}
-	c := Charge{ID: saved.ID, OrderID: saved.OrderID, AmountCents: saved.AmountCents, Status: saved.Status}
+	c := Charge{ID: saved.ID, OrderID: saved.OrderID, AmountCents: saved.AmountCents, Status: saved.Status, OrderState: saved.OrderState}
 	write(w, c)
 }
 func (s *Server) pay(w http.ResponseWriter, r *http.Request) {
@@ -124,7 +125,7 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "charge lookup failed", http.StatusInternalServerError)
 		return
 	}
-	c := Charge{ID: saved.ID, OrderID: saved.OrderID, AmountCents: saved.AmountCents, Status: saved.Status}
+	c := Charge{ID: saved.ID, OrderID: saved.OrderID, AmountCents: saved.AmountCents, Status: saved.Status, OrderState: saved.OrderState}
 	write(w, c)
 }
 func (s *Server) scenario(w http.ResponseWriter, r *http.Request) {

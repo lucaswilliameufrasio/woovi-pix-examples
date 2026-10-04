@@ -35,6 +35,7 @@ type SimulatedCharge struct {
 	OrderID     string `json:"order_id"`
 	AmountCents int64  `json:"amount_cents"`
 	Status      string `json:"status"`
+	OrderState  string `json:"order_state"`
 }
 
 type Store struct{ pool *pgxpool.Pool }
@@ -301,7 +302,7 @@ func (s *Store) CreateSimulatedCharge(ctx context.Context, orderID string, amoun
 
 func (s *Store) GetSimulatedCharge(ctx context.Context, orderID string) (SimulatedCharge, error) {
 	var c SimulatedCharge
-	err := s.pool.QueryRow(ctx, `SELECT charge_id,order_id,amount_cents,status FROM simulated_charges WHERE order_id=$1`, orderID).Scan(&c.ID, &c.OrderID, &c.AmountCents, &c.Status)
+	err := s.pool.QueryRow(ctx, `SELECT c.charge_id,c.order_id,c.amount_cents,c.status,o.state FROM simulated_charges c JOIN orders o ON o.id=c.order_id WHERE c.order_id=$1`, orderID).Scan(&c.ID, &c.OrderID, &c.AmountCents, &c.Status, &c.OrderState)
 	return c, err
 }
 
@@ -310,6 +311,10 @@ func (s *Store) MarkSimulatedChargePaid(ctx context.Context, orderID string) (Si
 	err := s.pool.QueryRow(ctx, `UPDATE simulated_charges SET status='paid',updated_at=now() WHERE order_id=$1 AND status='pending' RETURNING charge_id,order_id,amount_cents,status`, orderID).Scan(&c.ID, &c.OrderID, &c.AmountCents, &c.Status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		c, err = s.GetSimulatedCharge(ctx, orderID)
+	} else if err == nil {
+		var order Order
+		order, err = s.GetOrder(ctx, orderID)
+		c.OrderState = order.State
 	}
 	return c, err
 }
