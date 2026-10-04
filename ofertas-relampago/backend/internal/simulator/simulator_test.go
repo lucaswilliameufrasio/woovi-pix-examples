@@ -174,3 +174,41 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 		t.Fatalf("authoritative order state=%s", paid.State)
 	}
 }
+
+func TestDevelopmentScenarioRoutesRequireDemoMode(t *testing.T) {
+	t.Setenv("DEMO_MODE", "false")
+	h := (&Server{}).Handler()
+	for _, path := range []string{
+		"/dev/scenarios/timeout?order_id=order",
+		"/dev/scenarios/duplicate-paid/order",
+		"/dev/webhooks/order/late-paid",
+	} {
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, path, nil))
+		if recorder.Code != http.StatusNotFound {
+			t.Errorf("POST %s status=%d, want 404", path, recorder.Code)
+		}
+	}
+}
+
+func TestRetryChargeCannotUseAnotherOrderReference(t *testing.T) {
+	t.Setenv("DEMO_MODE", "true")
+	st, err := store.Open(context.Background(), os.Getenv("TEST_DATABASE_URL"))
+	if os.Getenv("TEST_DATABASE_URL") == "" {
+		t.Skip("TEST_DATABASE_URL is required for PostgreSQL integration tests")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	lookup := func(id string) (int64, error) {
+		order, err := st.GetOrder(context.Background(), id)
+		return order.Amount, err
+	}
+	h := New(st, lookup, nil).Handler()
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/charges/order-a/retry", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("retry without existing order status=%d, want 404", recorder.Code)
+	}
+}

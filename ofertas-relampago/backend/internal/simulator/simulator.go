@@ -50,13 +50,21 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createForOrder(w http.ResponseWriter, r *http.Request) {
+	if os.Getenv("DEMO_MODE") != "true" {
+		http.NotFound(w, r)
+		return
+	}
 	s.createCharge(w, r, r.PathValue("orderID"))
 }
 
 func (s *Server) createCharge(w http.ResponseWriter, r *http.Request, orderID string) {
 	amount, err := s.lookup(orderID)
 	if err != nil {
-		http.Error(w, "order not found", 404)
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "order not found", http.StatusNotFound)
+		} else {
+			http.Error(w, "order lookup failed", http.StatusInternalServerError)
+		}
 		return
 	}
 	saved, err := s.store.CreateSimulatedCharge(r.Context(), orderID, amount)
@@ -89,6 +97,10 @@ func (s *Server) pay(w http.ResponseWriter, r *http.Request) {
 	write(w, map[string]any{"status": "webhook accepted", "at": time.Now().UTC()})
 }
 func (s *Server) latePay(w http.ResponseWriter, r *http.Request) {
+	if os.Getenv("DEMO_MODE") != "true" {
+		http.NotFound(w, r)
+		return
+	}
 	if s.deliver == nil || s.deliver(r.PathValue("orderID"), "late-paid:"+r.PathValue("orderID")) != nil {
 		http.Error(w, "delivery failed", http.StatusBadGateway)
 		return
