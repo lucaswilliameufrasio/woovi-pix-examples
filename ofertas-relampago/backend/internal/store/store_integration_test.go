@@ -362,3 +362,51 @@ func TestTransientWorkerFailureSchedulesRetryAndThenProcesses(t *testing.T) {
 		t.Fatalf("order state after retry=%s", paid.State)
 	}
 }
+
+func TestConcurrentWorkersClaimEachPaymentEventOnce(t *testing.T) {
+	s := integrationStore(t)
+	offer := offerID(t)
+	if _, err := s.pool.Exec(context.Background(), `UPDATE offers SET total_units=20,available_units=20 WHERE id=$1`, offer); err != nil {
+		t.Fatal(err)
+	}
+	const events = 20
+	for i := 0; i < events; i++ {
+		id := offer + "-worker-" + testID(t)
+		order, err := s.CreateOrder(context.Background(), id, offer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if inserted, err := s.PersistPaidEvent(context.Background(), testID(t), order.ID, "parallel-"+testID(t)); err != nil || !inserted {
+			t.Fatalf("persist event inserted=%v err=%v", inserted, err)
+		}
+	}
+	start := make(chan struct{})
+	results := make(chan int, 2)
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			n, err := s.ProcessPaymentEvents(context.Background(), events)
+			results <- n
+			errs <- err
+		}()
+	}
+	close(start)
+	processed := 0
+	for i := 0; i < 2; i++ {
+		processed += <-results
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if processed != events {
+		t.Fatalf("claimed/processed events=%d want %d", processed, events)
+	}
+	var completed, wrongAttempts int
+	if err := s.pool.QueryRow(context.Background(), `SELECT count(*) FILTER(WHERE processed_at IS NOT NULL),count(*) FILTER(WHERE attempts<>1) FROM payment_events WHERE order_id IN (SELECT id FROM orders WHERE offer_id=$1)`, offer).Scan(&completed, &wrongAttempts); err != nil {
+		t.Fatal(err)
+	}
+	if completed != events || wrongAttempts != 0 {
+		t.Fatalf("completed=%d attempts_not_once=%d", completed, wrongAttempts)
+	}
+}
