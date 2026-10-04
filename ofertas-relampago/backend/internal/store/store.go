@@ -274,15 +274,18 @@ func (s *Store) ProcessPaymentEvents(ctx context.Context, limit int) (int, error
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	rows, err := tx.Query(ctx, `SELECT id,order_id FROM payment_events WHERE processed_at IS NULL AND (lease_until IS NULL OR lease_until<now()) ORDER BY received_at FOR UPDATE SKIP LOCKED LIMIT $1`, limit)
+	rows, err := tx.Query(ctx, `SELECT id,order_id,attempts+1 FROM payment_events WHERE processed_at IS NULL AND (lease_until IS NULL OR lease_until<now()) ORDER BY received_at FOR UPDATE SKIP LOCKED LIMIT $1`, limit)
 	if err != nil {
 		return 0, err
 	}
-	type event struct{ id, orderID string }
+	type event struct {
+		id, orderID string
+		attempts    int
+	}
 	var events []event
 	for rows.Next() {
 		var e event
-		if err := rows.Scan(&e.id, &e.orderID); err != nil {
+		if err := rows.Scan(&e.id, &e.orderID, &e.attempts); err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -294,34 +297,73 @@ func (s *Store) ProcessPaymentEvents(ctx context.Context, limit int) (int, error
 	}
 	rows.Close()
 	for _, e := range events {
-		if _, err := tx.Exec(ctx, `UPDATE payment_events SET lease_until=now()+interval '30 seconds',attempts=attempts+1 WHERE id=$1`, e.id); err != nil {
-			return 0, err
-		}
-		var state, offerID string
-		var expiresAt, now time.Time
-		if err := tx.QueryRow(ctx, `SELECT state,offer_id,expires_at,now() FROM orders WHERE id=$1 FOR UPDATE`, e.orderID).Scan(&state, &offerID, &expiresAt, &now); err != nil {
-			return 0, err
-		}
-		newState := "payment_exception"
-		if state == "pending_payment" && expiresAt.After(now) {
-			newState = "paid"
-		}
-		if state == "pending_payment" || state == "expired" {
-			if _, err := tx.Exec(ctx, `UPDATE orders SET state=$2 WHERE id=$1`, e.orderID, newState); err != nil {
-				return 0, err
-			}
-		}
-		if state == "pending_payment" && newState == "payment_exception" {
-			if _, err := tx.Exec(ctx, `UPDATE offers SET available_units=LEAST(total_units,available_units+1) WHERE id=$1`, offerID); err != nil {
-				return 0, err
-			}
-		}
-		if _, err := tx.Exec(ctx, `UPDATE payment_events SET processed_at=now(),lease_until=NULL WHERE id=$1`, e.id); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE payment_events SET lease_until=now()+interval '30 seconds',attempts=$2 WHERE id=$1`, e.id, e.attempts); err != nil {
 			return 0, err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
-	return len(events), nil
+	processed := 0
+	for _, e := range events {
+		if err := s.processPaymentEvent(ctx, e.id, e.orderID); err != nil {
+			backoff := retryBackoff(e.attempts)
+			_, releaseErr := s.pool.Exec(ctx, `UPDATE payment_events SET lease_until=now()+($2 * interval '1 second'),last_error='transient processing error' WHERE id=$1 AND processed_at IS NULL`, e.id, int64(backoff.Seconds()))
+			if releaseErr != nil {
+				return processed, fmt.Errorf("process payment event: %w; release lease: %v", err, releaseErr)
+			}
+			return processed, fmt.Errorf("process payment event: %w", err)
+		}
+		processed++
+	}
+	return processed, nil
+}
+
+func retryBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	seconds := 1 << min(attempt-1, 9)
+	if seconds > 300 {
+		seconds = 300
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func (s *Store) processPaymentEvent(ctx context.Context, eventID, orderID string) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var processedAt *time.Time
+	if err := tx.QueryRow(ctx, `SELECT processed_at FROM payment_events WHERE id=$1 FOR UPDATE`, eventID).Scan(&processedAt); err != nil {
+		return err
+	}
+	if processedAt != nil {
+		return tx.Commit(ctx)
+	}
+	var state, offerID string
+	var expiresAt, now time.Time
+	if err := tx.QueryRow(ctx, `SELECT state,offer_id,expires_at,now() FROM orders WHERE id=$1 FOR UPDATE`, orderID).Scan(&state, &offerID, &expiresAt, &now); err != nil {
+		return err
+	}
+	newState := "payment_exception"
+	if state == "pending_payment" && expiresAt.After(now) {
+		newState = "paid"
+	}
+	if state == "pending_payment" || state == "expired" {
+		if _, err := tx.Exec(ctx, `UPDATE orders SET state=$2 WHERE id=$1`, orderID, newState); err != nil {
+			return err
+		}
+	}
+	if state == "pending_payment" && newState == "payment_exception" {
+		if _, err := tx.Exec(ctx, `UPDATE offers SET available_units=LEAST(total_units,available_units+1) WHERE id=$1`, offerID); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE payment_events SET processed_at=now(),lease_until=NULL,last_error=NULL WHERE id=$1`, eventID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }

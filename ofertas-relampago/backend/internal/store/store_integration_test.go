@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 )
 
 func integrationStore(t *testing.T) *Store {
@@ -270,5 +271,47 @@ func TestWebhookEventKeyCannotBeReusedAcrossOrders(t *testing.T) {
 	}
 	if _, err := s.PersistPaidEvent(context.Background(), testID(t), second.ID, eventKey); !errors.Is(err, ErrEventKeyConflict) {
 		t.Fatalf("expected event-key conflict, got %v", err)
+	}
+}
+
+func TestWorkerRecoversEventAfterExpiredLease(t *testing.T) {
+	s := integrationStore(t)
+	order, err := s.CreateOrder(context.Background(), offerID(t)+"-lease", offerID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID, eventKey := testID(t), "lease-event-"+testID(t)
+	if created, err := s.PersistPaidEvent(context.Background(), eventID, order.ID, eventKey); err != nil || !created {
+		t.Fatalf("persist event created=%v err=%v", created, err)
+	}
+	if _, err := s.pool.Exec(context.Background(), `UPDATE payment_events SET attempts=1,lease_until=now()+interval '30 seconds' WHERE id=$1`, eventID); err != nil {
+		t.Fatal(err)
+	}
+	processed, err := s.ProcessPaymentEvents(context.Background(), 10)
+	if err != nil || processed != 0 {
+		t.Fatalf("active lease processed=%d err=%v", processed, err)
+	}
+	if _, err := s.pool.Exec(context.Background(), `UPDATE payment_events SET lease_until=now()-interval '1 second' WHERE id=$1`, eventID); err != nil {
+		t.Fatal(err)
+	}
+	processed, err = s.ProcessPaymentEvents(context.Background(), 10)
+	if err != nil || processed != 1 {
+		t.Fatalf("recovered lease processed=%d err=%v", processed, err)
+	}
+	var attempts int
+	var processedAt *time.Time
+	if err := s.pool.QueryRow(context.Background(), `SELECT attempts,processed_at FROM payment_events WHERE id=$1`, eventID).Scan(&attempts, &processedAt); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 || processedAt == nil {
+		t.Fatalf("attempts=%d processed_at=%v", attempts, processedAt)
+	}
+}
+
+func TestRetryBackoffIsBounded(t *testing.T) {
+	for attempt, want := range map[int]time.Duration{1: time.Second, 2: 2 * time.Second, 9: 256 * time.Second, 10: 300 * time.Second, 100: 300 * time.Second} {
+		if got := retryBackoff(attempt); got != want {
+			t.Errorf("retryBackoff(%d)=%s want %s", attempt, got, want)
+		}
 	}
 }
