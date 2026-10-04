@@ -34,6 +34,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /dev/webhooks/{orderID}/paid", s.pay)
 	mux.HandleFunc("POST /dev/webhooks/{orderID}/late-paid", s.latePay)
 	mux.HandleFunc("POST /dev/scenarios/{name}", s.scenario)
+	mux.HandleFunc("POST /dev/scenarios/{name}/{orderID}", s.scenarioForOrder)
 	return mux
 }
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
@@ -104,8 +105,6 @@ func (s *Server) scenario(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch r.PathValue("name") {
-	case "duplicate-paid":
-		s.pay(w, r)
 	case "timeout":
 		http.Error(w, "simulated timeout after charge creation", http.StatusGatewayTimeout)
 	case "rate-limit":
@@ -117,6 +116,18 @@ func (s *Server) scenario(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "unknown scenario", http.StatusNotFound)
 	}
+}
+
+func (s *Server) scenarioForOrder(w http.ResponseWriter, r *http.Request) {
+	if os.Getenv("DEMO_MODE") != "true" {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if r.PathValue("name") != "duplicate-paid" {
+		http.Error(w, "unknown scenario", http.StatusNotFound)
+		return
+	}
+	s.pay(w, r)
 }
 func write(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")

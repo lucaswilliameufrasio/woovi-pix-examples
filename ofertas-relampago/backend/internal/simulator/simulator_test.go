@@ -117,6 +117,26 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("pay status=%d", resp.StatusCode)
 	}
+	resp, err = client.Post(sim.URL+"/dev/scenarios/duplicate-paid/"+order.ID, "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("duplicate webhook scenario status=%d", resp.StatusCode)
+	}
+	resp, err = client.Get(sim.URL + "/charges/" + order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paidCharge Charge
+	if err := json.NewDecoder(resp.Body).Decode(&paidCharge); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if paidCharge.Status != "paid" {
+		t.Fatalf("charge after pay status=%s", paidCharge.Status)
+	}
 	if _, err := st.ProcessPaymentEvents(ctx, 10); err != nil {
 		t.Fatal(err)
 	}
