@@ -29,13 +29,15 @@ func New(st *store.Store, lookup func(string) (int64, error), deliver func(strin
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /charges", s.create)
-	mux.HandleFunc("POST /charges/{orderID}/retry", s.createForOrder)
 	mux.HandleFunc("POST /charges/{orderID}/pay", s.pay)
 	mux.HandleFunc("GET /charges/{orderID}", s.get)
-	mux.HandleFunc("POST /dev/webhooks/{orderID}/paid", s.pay)
-	mux.HandleFunc("POST /dev/webhooks/{orderID}/late-paid", s.latePay)
-	mux.HandleFunc("POST /dev/scenarios/{name}", s.scenario)
-	mux.HandleFunc("POST /dev/scenarios/{name}/{orderID}", s.scenarioForOrder)
+	if os.Getenv("DEMO_MODE") == "true" {
+		mux.HandleFunc("POST /charges/{orderID}/retry", s.createForOrder)
+		mux.HandleFunc("POST /dev/webhooks/{orderID}/paid", s.pay)
+		mux.HandleFunc("POST /dev/webhooks/{orderID}/late-paid", s.latePay)
+		mux.HandleFunc("POST /dev/scenarios/{name}", s.scenario)
+		mux.HandleFunc("POST /dev/scenarios/{name}/{orderID}", s.scenarioForOrder)
+	}
 	return mux
 }
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
@@ -50,10 +52,6 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createForOrder(w http.ResponseWriter, r *http.Request) {
-	if os.Getenv("DEMO_MODE") != "true" {
-		http.NotFound(w, r)
-		return
-	}
 	s.createCharge(w, r, r.PathValue("orderID"))
 }
 
@@ -80,6 +78,10 @@ func (s *Server) createCharge(w http.ResponseWriter, r *http.Request, orderID st
 	write(w, c)
 }
 func (s *Server) pay(w http.ResponseWriter, r *http.Request) {
+	if os.Getenv("DEMO_MODE") != "true" {
+		http.NotFound(w, r)
+		return
+	}
 	orderID := r.PathValue("orderID")
 	charge, err := s.store.MarkSimulatedChargePaid(r.Context(), orderID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -97,10 +99,6 @@ func (s *Server) pay(w http.ResponseWriter, r *http.Request) {
 	write(w, map[string]any{"status": "webhook accepted", "at": time.Now().UTC()})
 }
 func (s *Server) latePay(w http.ResponseWriter, r *http.Request) {
-	if os.Getenv("DEMO_MODE") != "true" {
-		http.NotFound(w, r)
-		return
-	}
 	if s.deliver == nil || s.deliver(r.PathValue("orderID"), "late-paid:"+r.PathValue("orderID")) != nil {
 		http.Error(w, "delivery failed", http.StatusBadGateway)
 		return
@@ -121,10 +119,6 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 	write(w, c)
 }
 func (s *Server) scenario(w http.ResponseWriter, r *http.Request) {
-	if os.Getenv("DEMO_MODE") != "true" {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
 	switch r.PathValue("name") {
 	case "timeout":
 		orderID := r.URL.Query().Get("order_id")
@@ -134,7 +128,11 @@ func (s *Server) scenario(w http.ResponseWriter, r *http.Request) {
 		}
 		amount, err := s.lookup(orderID)
 		if err != nil {
-			http.Error(w, "order not found", http.StatusNotFound)
+			if errors.Is(err, pgx.ErrNoRows) {
+				http.Error(w, "order not found", http.StatusNotFound)
+			} else {
+				http.Error(w, "order lookup failed", http.StatusInternalServerError)
+			}
 			return
 		}
 		if _, err := s.store.CreateSimulatedCharge(r.Context(), orderID, amount); err != nil {
@@ -154,10 +152,6 @@ func (s *Server) scenario(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) scenarioForOrder(w http.ResponseWriter, r *http.Request) {
-	if os.Getenv("DEMO_MODE") != "true" {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
 	if r.PathValue("name") != "duplicate-paid" {
 		http.Error(w, "unknown scenario", http.StatusNotFound)
 		return

@@ -177,7 +177,7 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 
 func TestDevelopmentScenarioRoutesRequireDemoMode(t *testing.T) {
 	t.Setenv("DEMO_MODE", "false")
-	h := (&Server{}).Handler()
+	h := New(nil, nil, nil).Handler()
 	for _, path := range []string{
 		"/dev/scenarios/timeout?order_id=order",
 		"/dev/scenarios/duplicate-paid/order",
@@ -210,5 +210,24 @@ func TestRetryChargeCannotUseAnotherOrderReference(t *testing.T) {
 	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/charges/order-a/retry", nil))
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("retry without existing order status=%d, want 404", recorder.Code)
+	}
+}
+
+func TestAllPaymentMutationRoutesAreHiddenWithoutDemoMode(t *testing.T) {
+	t.Setenv("DEMO_MODE", "false")
+	h := New(nil, nil, nil).Handler()
+	for _, path := range []string{
+		"/charges/order-a/pay",
+		"/charges/order-a/retry",
+		"/dev/webhooks/order-a/paid",
+		"/dev/webhooks/order-a/late-paid",
+		"/dev/scenarios/timeout?order_id=order-a",
+		"/dev/scenarios/duplicate-paid/order-a",
+	} {
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, path, nil))
+		if recorder.Code != http.StatusNotFound {
+			t.Errorf("POST %s status=%d, want 404", path, recorder.Code)
+		}
 	}
 }
