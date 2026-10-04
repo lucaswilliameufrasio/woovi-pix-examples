@@ -98,7 +98,7 @@ func simulatorHandler(st *store.Store) http.Handler {
 		body, _ := json.Marshal(map[string]string{"order_id": orderID, "event_key": eventKey})
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+env("INTERNAL_API_ADDR", "127.0.0.1:8080")+"/dev/webhooks/paid", bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+env("INTERNAL_API_ADDR", "127.0.0.1:8080")+"/v1/dev/webhooks/paid", bytes.NewReader(body))
 		if err != nil {
 			return err
 		}

@@ -55,7 +55,8 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 	api := httptest.NewServer((httpapi.API{Store: st}).Handler())
 	defer api.Close()
 	apiHandler := (httpapi.API{Store: st}).Handler()
-	req := httptest.NewRequest(http.MethodPost, "/orders", bytes.NewBufferString(`{"offer_id":"`+offerID+`"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/orders", bytes.NewBufferString(`{"offer_id":"`+offerID+`"}`))
+	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	apiHandler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {
@@ -69,7 +70,7 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 	lookup := func(id string) (int64, error) { o, err := st.GetOrder(ctx, id); return o.Amount, err }
 	deliver := func(id, eventKey string) error {
 		body, _ := json.Marshal(map[string]string{"order_id": id, "event_key": eventKey})
-		resp, err := client.Post(api.URL+"/dev/webhooks/paid", "application/json", bytes.NewReader(body))
+		resp, err := client.Post(api.URL+"/v1/dev/webhooks/paid", "application/json", bytes.NewReader(body))
 		if err != nil {
 			return err
 		}
@@ -82,7 +83,7 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 	sim := httptest.NewServer(New(st, lookup, deliver).Handler())
 	defer sim.Close()
 	chargeBody, _ := json.Marshal(map[string]string{"order_id": order.ID})
-	resp, err := client.Post(sim.URL+"/charges", "application/json", bytes.NewReader(chargeBody))
+	resp, err := client.Post(sim.URL+"/v1/charges", "application/json", bytes.NewReader(chargeBody))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,21 +95,39 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || charge.AmountCents != 1999 {
 		t.Fatalf("charge=%+v status=%d", charge, resp.StatusCode)
 	}
+	for _, body := range []string{`{"orderID":"` + order.ID + `"}`, `{"order_id":`} {
+		resp, err = client.Post(sim.URL+"/v1/charges", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var apiErr map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&apiErr); err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest || apiErr["error_code"] != "MALFORMED_REQUEST" || apiErr["message"] == nil {
+			t.Fatalf("request contract error status=%d body=%v", resp.StatusCode, apiErr)
+		}
+	}
 	// The timeout scenario persists a charge but drops the response; retrying
 	// with the same order reference must recover the exact same charge.
 	other, err := st.CreateOrder(ctx, "timeout-"+offerID, offerID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err = client.Post(sim.URL+"/dev/scenarios/timeout?order_id="+other.ID, "application/json", nil)
+	resp, err = client.Post(sim.URL+"/v1/dev/scenarios/timeout?order_id="+other.ID, "application/json", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusGatewayTimeout {
-		t.Fatalf("timeout scenario status=%d", resp.StatusCode)
+	var timeoutError map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&timeoutError); err != nil {
+		t.Fatal(err)
 	}
-	resp, err = client.Post(sim.URL+"/charges/"+other.ID+"/retry", "application/json", nil)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusGatewayTimeout || timeoutError["error_code"] != "SIMULATED_TIMEOUT" || timeoutError["message"] == nil {
+		t.Fatalf("timeout scenario status=%d body=%v", resp.StatusCode, timeoutError)
+	}
+	resp, err = client.Post(sim.URL+"/v1/charges/"+other.ID+"/retry", "application/json", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +143,7 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 	// A fresh simulator process reads the same durable charge from PostgreSQL.
 	sim = httptest.NewServer(New(st, lookup, deliver).Handler())
 	defer sim.Close()
-	resp, err = client.Get(sim.URL + "/charges/" + order.ID)
+	resp, err = client.Get(sim.URL + "/v1/charges/" + order.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +155,7 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || recovered.ID != charge.ID || recovered.AmountCents != charge.AmountCents {
 		t.Fatalf("recovered charge=%+v status=%d", recovered, resp.StatusCode)
 	}
-	resp, err = client.Post(sim.URL+"/charges/"+order.ID+"/pay", "application/json", nil)
+	resp, err = client.Post(sim.URL+"/v1/charges/"+order.ID+"/pay", "application/json", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +163,7 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("pay status=%d", resp.StatusCode)
 	}
-	resp, err = client.Post(sim.URL+"/dev/scenarios/duplicate-paid/"+order.ID, "application/json", nil)
+	resp, err = client.Post(sim.URL+"/v1/dev/scenarios/duplicate_paid/"+order.ID, "application/json", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +171,7 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("duplicate webhook scenario status=%d", resp.StatusCode)
 	}
-	resp, err = client.Get(sim.URL + "/charges/" + order.ID)
+	resp, err = client.Get(sim.URL + "/v1/charges/" + order.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +196,7 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 	if paid.State != "paid" {
 		t.Fatalf("authoritative order state=%s", paid.State)
 	}
-	resp, err = client.Get(sim.URL + "/charges/" + order.ID)
+	resp, err = client.Get(sim.URL + "/v1/charges/" + order.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,9 +214,9 @@ func TestDevelopmentScenarioRoutesRequireDemoMode(t *testing.T) {
 	t.Setenv("DEMO_MODE", "false")
 	h := New(nil, nil, nil).Handler()
 	for _, path := range []string{
-		"/dev/scenarios/timeout?order_id=order",
-		"/dev/scenarios/duplicate-paid/order",
-		"/dev/webhooks/order/late-paid",
+		"/v1/dev/scenarios/timeout?order_id=order",
+		"/v1/dev/scenarios/duplicate_paid/order",
+		"/v1/dev/webhooks/order/late_paid",
 	} {
 		recorder := httptest.NewRecorder()
 		h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, path, nil))
@@ -223,7 +242,7 @@ func TestRetryChargeCannotUseAnotherOrderReference(t *testing.T) {
 	}
 	h := New(st, lookup, nil).Handler()
 	recorder := httptest.NewRecorder()
-	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/charges/order-a/retry", nil))
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/charges/order-a/retry", nil))
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("retry without existing order status=%d, want 404", recorder.Code)
 	}
@@ -233,17 +252,53 @@ func TestAllPaymentMutationRoutesAreHiddenWithoutDemoMode(t *testing.T) {
 	t.Setenv("DEMO_MODE", "false")
 	h := New(nil, nil, nil).Handler()
 	for _, path := range []string{
-		"/charges/order-a/pay",
-		"/charges/order-a/retry",
-		"/dev/webhooks/order-a/paid",
-		"/dev/webhooks/order-a/late-paid",
-		"/dev/scenarios/timeout?order_id=order-a",
-		"/dev/scenarios/duplicate-paid/order-a",
+		"/v1/charges/order-a/pay",
+		"/v1/charges/order-a/retry",
+		"/v1/dev/webhooks/order-a/paid",
+		"/v1/dev/webhooks/order-a/late_paid",
+		"/v1/dev/scenarios/timeout?order_id=order-a",
+		"/v1/dev/scenarios/duplicate_paid/order-a",
 	} {
 		recorder := httptest.NewRecorder()
 		h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, path, nil))
 		if recorder.Code != http.StatusNotFound {
 			t.Errorf("POST %s status=%d, want 404", path, recorder.Code)
+		}
+	}
+}
+
+func TestVersionedSimulatorReadRoutesRemainAvailableOutsideDemoMode(t *testing.T) {
+	t.Setenv("DEMO_MODE", "false")
+	h := New(nil, nil, nil).Handler()
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/charges/order-a", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("legacy unversioned route status=%d, want 404", recorder.Code)
+	}
+}
+
+func TestSimulatorUsesHouseErrorEnvelopeForMalformedAndLargeBodies(t *testing.T) {
+	t.Setenv("DEMO_MODE", "true")
+	h := New(nil, nil, nil).Handler()
+	tests := []struct {
+		body       string
+		wantStatus int
+		wantCode   string
+	}{
+		{"{", http.StatusBadRequest, "MALFORMED_REQUEST"},
+		{"{\"order_id\":\"" + strings.Repeat("x", 5000) + "\"}", http.StatusRequestEntityTooLarge, "PAYLOAD_TOO_LARGE"},
+	}
+	for _, tc := range tests {
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/charges", strings.NewReader(tc.body))
+		req.Header.Set("Content-Type", "application/json")
+		h.ServeHTTP(recorder, req)
+		var body map[string]any
+		if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if recorder.Code != tc.wantStatus || body["error_code"] != tc.wantCode || body["message"] == nil {
+			t.Errorf("status=%d body=%v want status=%d code=%s", recorder.Code, body, tc.wantStatus, tc.wantCode)
 		}
 	}
 }
@@ -296,7 +351,7 @@ func TestPayEndpointDoesNotClaimOperationalSuccessForLatePayment(t *testing.T) {
 		return err
 	}).Handler()
 	recorder := httptest.NewRecorder()
-	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/charges/"+order.ID+"/pay", nil))
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/charges/"+order.ID+"/pay", nil))
 	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "late payment recorded for review") {
 		t.Fatalf("late pay status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
