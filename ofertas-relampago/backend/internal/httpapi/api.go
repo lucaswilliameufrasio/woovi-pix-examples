@@ -120,6 +120,10 @@ func (a API) paidWebhook(w http.ResponseWriter, r *http.Request) {
 	sum := sha256.Sum256([]byte(in.EventKey))
 	eventID := hex.EncodeToString(sum[:])
 	_, err := a.Store.PersistPaidEvent(r.Context(), eventID, in.OrderID, in.EventKey)
+	if errors.Is(err, store.ErrEventKeyConflict) {
+		writeError(w, http.StatusConflict, "idempotency_conflict")
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error")
 		return

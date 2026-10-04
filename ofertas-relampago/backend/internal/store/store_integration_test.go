@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"os"
 	"sync"
 	"testing"
@@ -20,17 +21,13 @@ func integrationStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lockID := int64(421337)
-	if _, err := s.pool.Exec(ctx, `SELECT pg_advisory_lock($1)`, lockID); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _, _ = s.pool.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, lockID) })
 	t.Cleanup(s.Close)
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
 	offerID := testID(t)
 	t.Cleanup(func() {
+		_, _ = s.pool.Exec(context.Background(), `DELETE FROM payment_events WHERE order_id IN (SELECT id FROM orders WHERE offer_id=$1)`, offerID)
 		_, _ = s.pool.Exec(context.Background(), `DELETE FROM orders WHERE offer_id=$1`, offerID)
 		_, _ = s.pool.Exec(context.Background(), `UPDATE offers SET available_units=total_units WHERE id=$1`, offerID)
 		_, _ = s.pool.Exec(context.Background(), `DELETE FROM offers WHERE id=$1`, offerID)
@@ -251,5 +248,27 @@ func TestWebhookDedupAndWorkerProcessOnce(t *testing.T) {
 	}
 	if paid.State != "paid" {
 		t.Fatalf("order state=%s", paid.State)
+	}
+}
+
+func TestWebhookEventKeyCannotBeReusedAcrossOrders(t *testing.T) {
+	s := integrationStore(t)
+	if _, err := s.pool.Exec(context.Background(), `UPDATE offers SET total_units=2,available_units=2 WHERE id=$1`, offerID(t)); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.CreateOrder(context.Background(), offerID(t)+"-event-first", offerID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.CreateOrder(context.Background(), offerID(t)+"-event-second", offerID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventKey := "unique-event-" + testID(t)
+	if inserted, err := s.PersistPaidEvent(context.Background(), testID(t), first.ID, eventKey); err != nil || !inserted {
+		t.Fatalf("first insert=%v err=%v", inserted, err)
+	}
+	if _, err := s.PersistPaidEvent(context.Background(), testID(t), second.ID, eventKey); !errors.Is(err, ErrEventKeyConflict) {
+		t.Fatalf("expected event-key conflict, got %v", err)
 	}
 }

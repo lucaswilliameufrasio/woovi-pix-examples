@@ -27,19 +27,6 @@ func TestOrderRoutesAgainstPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	lockID := int64(421337)
-	lockConn, err := pool.Acquire(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_lock($1)`, lockID); err != nil {
-		lockConn.Release()
-		t.Fatal(err)
-	}
-	defer func() {
-		_, _ = lockConn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, lockID)
-		lockConn.Release()
-	}()
 	st, err := store.Open(ctx, dbURL)
 	if err != nil {
 		t.Fatal(err)

@@ -11,6 +11,7 @@ import (
 )
 
 var ErrUnavailable = errors.New("offer unavailable")
+var ErrEventKeyConflict = errors.New("event key already belongs to another order")
 
 type Offer struct {
 	ID                   string `json:"id"`
@@ -58,6 +59,10 @@ func (s *Store) Migrate(ctx context.Context) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin schema migration: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(421337)`); err != nil {
+		_ = tx.Rollback(ctx)
+		return fmt.Errorf("lock schema migration: %w", err)
 	}
 	if _, err := tx.Exec(ctx, schema); err != nil {
 		_ = tx.Rollback(ctx)
@@ -240,8 +245,27 @@ func (s *Store) ResetDemo(ctx context.Context) error {
 }
 
 func (s *Store) PersistPaidEvent(ctx context.Context, id, orderID, eventKey string) (bool, error) {
-	tag, err := s.pool.Exec(ctx, `INSERT INTO payment_events(id,order_id,event_type,event_key) VALUES($1,$2,'paid',$3) ON CONFLICT(event_key) DO NOTHING`, id, orderID, eventKey)
-	return tag.RowsAffected() == 1, err
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	tag, err := tx.Exec(ctx, `INSERT INTO payment_events(id,order_id,event_type,event_key) VALUES($1,$2,'paid',$3) ON CONFLICT(event_key) DO NOTHING`, id, orderID, eventKey)
+	if err != nil {
+		return false, err
+	}
+	created := tag.RowsAffected() == 1
+	var existingOrderID string
+	if err := tx.QueryRow(ctx, `SELECT order_id FROM payment_events WHERE event_key=$1`, eventKey).Scan(&existingOrderID); err != nil {
+		return false, err
+	}
+	if existingOrderID != orderID {
+		return false, ErrEventKeyConflict
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return created, nil
 }
 
 func (s *Store) ProcessPaymentEvents(ctx context.Context, limit int) (int, error) {
