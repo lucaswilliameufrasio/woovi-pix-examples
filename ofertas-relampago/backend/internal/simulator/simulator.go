@@ -92,11 +92,20 @@ func (s *Server) pay(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "charge persistence failed", http.StatusInternalServerError)
 		return
 	}
+	order, err := s.store.GetOrder(r.Context(), charge.OrderID)
+	if err != nil {
+		http.Error(w, "order lookup failed", http.StatusInternalServerError)
+		return
+	}
 	if s.deliver == nil || s.deliver(charge.OrderID, "paid:"+charge.OrderID) != nil {
 		http.Error(w, "delivery failed", http.StatusBadGateway)
 		return
 	}
-	write(w, map[string]any{"status": "webhook accepted", "at": time.Now().UTC()})
+	status := "webhook accepted"
+	if order.State == "expired" {
+		status = "late payment recorded for review"
+	}
+	write(w, map[string]any{"status": status, "at": time.Now().UTC()})
 }
 func (s *Server) latePay(w http.ResponseWriter, r *http.Request) {
 	if s.deliver == nil || s.deliver(r.PathValue("orderID"), "late-paid:"+r.PathValue("orderID")) != nil {

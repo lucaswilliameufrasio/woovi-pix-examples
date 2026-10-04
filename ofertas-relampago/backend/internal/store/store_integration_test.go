@@ -254,6 +254,32 @@ func TestWebhookDedupAndWorkerProcessOnce(t *testing.T) {
 	}
 }
 
+func TestLateWebhookDoesNotRegressPaidOrder(t *testing.T) {
+	s := integrationStore(t)
+	order, err := s.CreateOrder(context.Background(), offerID(t)+"-out-of-order", offerID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MarkPaid(context.Background(), order.ID); err != nil {
+		t.Fatal(err)
+	}
+	created, err := s.PersistPaidEvent(context.Background(), testID(t), order.ID, "late-notification-"+testID(t))
+	if err != nil || !created {
+		t.Fatalf("late event created=%v err=%v", created, err)
+	}
+	processed, err := s.ProcessPaymentEvents(context.Background(), 10)
+	if err != nil || processed != 1 {
+		t.Fatalf("processed=%d err=%v", processed, err)
+	}
+	current, err := s.GetOrder(context.Background(), order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State != "paid" {
+		t.Fatalf("late duplicate notification regressed order to %q", current.State)
+	}
+}
+
 func TestWebhookEventKeyCannotBeReusedAcrossOrders(t *testing.T) {
 	s := integrationStore(t)
 	if _, err := s.pool.Exec(context.Background(), `UPDATE offers SET total_units=2,available_units=2 WHERE id=$1`, offerID(t)); err != nil {

@@ -307,7 +307,10 @@ func (s *Store) GetSimulatedCharge(ctx context.Context, orderID string) (Simulat
 
 func (s *Store) MarkSimulatedChargePaid(ctx context.Context, orderID string) (SimulatedCharge, error) {
 	var c SimulatedCharge
-	err := s.pool.QueryRow(ctx, `UPDATE simulated_charges SET status='paid',updated_at=now() WHERE order_id=$1 RETURNING charge_id,order_id,amount_cents,status`, orderID).Scan(&c.ID, &c.OrderID, &c.AmountCents, &c.Status)
+	err := s.pool.QueryRow(ctx, `UPDATE simulated_charges SET status='paid',updated_at=now() WHERE order_id=$1 AND status='pending' RETURNING charge_id,order_id,amount_cents,status`, orderID).Scan(&c.ID, &c.OrderID, &c.AmountCents, &c.Status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		c, err = s.GetSimulatedCharge(ctx, orderID)
+	}
 	return c, err
 }
 

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -230,4 +231,78 @@ func TestAllPaymentMutationRoutesAreHiddenWithoutDemoMode(t *testing.T) {
 			t.Errorf("POST %s status=%d, want 404", path, recorder.Code)
 		}
 	}
+}
+
+func TestPayEndpointDoesNotClaimOperationalSuccessForLatePayment(t *testing.T) {
+	t.Setenv("DEMO_MODE", "true")
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL is required for PostgreSQL integration tests")
+	}
+	ctx := context.Background()
+	st, err := store.Open(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	offer := "late-sim-" + testSimulatorID(t)
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `INSERT INTO offers(id,title,price_cents,total_units,available_units,reservation_ttl_seconds) VALUES($1,'Late payment test',500,1,1,60)`, offer); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM simulated_charges WHERE order_id IN (SELECT id FROM orders WHERE offer_id=$1)`, offer)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM payment_events WHERE order_id IN (SELECT id FROM orders WHERE offer_id=$1)`, offer)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM orders WHERE offer_id=$1`, offer)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM offers WHERE id=$1`, offer)
+	}()
+	order, err := st.CreateOrder(ctx, "late-order-"+offer, offer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateSimulatedCharge(ctx, order.ID, order.Amount); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE orders SET expires_at=now()-interval '1 second' WHERE id=$1`, order.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ExpireOrders(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h := New(st, func(id string) (int64, error) { o, err := st.GetOrder(ctx, id); return o.Amount, err }, func(id, key string) error {
+		_, err := st.PersistPaidEvent(ctx, key, id, key)
+		return err
+	}).Handler()
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/charges/"+order.ID+"/pay", nil))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "late payment recorded for review") {
+		t.Fatalf("late pay status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	charge, err := st.GetSimulatedCharge(ctx, order.ID)
+	if err != nil || charge.Status != "paid" {
+		t.Fatalf("charge=%+v err=%v", charge, err)
+	}
+	if _, err := st.ProcessPaymentEvents(ctx, 10); err != nil {
+		t.Fatal(err)
+	}
+	final, err := st.GetOrder(ctx, order.ID)
+	if err != nil || final.State != "payment_exception" {
+		t.Fatalf("order=%+v err=%v", final, err)
+	}
+}
+
+func testSimulatorID(t *testing.T) string {
+	t.Helper()
+	var id [8]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		t.Fatal(err)
+	}
+	return hex.EncodeToString(id[:])
 }
