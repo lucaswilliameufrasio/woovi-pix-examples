@@ -269,6 +269,10 @@ func (s *Store) PersistPaidEvent(ctx context.Context, id, orderID, eventKey stri
 }
 
 func (s *Store) ProcessPaymentEvents(ctx context.Context, limit int) (int, error) {
+	return s.processPaymentEvents(ctx, limit, s.processPaymentEvent)
+}
+
+func (s *Store) processPaymentEvents(ctx context.Context, limit int, process func(context.Context, string, string) error) (int, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return 0, err
@@ -306,7 +310,7 @@ func (s *Store) ProcessPaymentEvents(ctx context.Context, limit int) (int, error
 	}
 	processed := 0
 	for _, e := range events {
-		if err := s.processPaymentEvent(ctx, e.id, e.orderID); err != nil {
+		if err := process(ctx, e.id, e.orderID); err != nil {
 			backoff := retryBackoff(e.attempts)
 			_, releaseErr := s.pool.Exec(ctx, `UPDATE payment_events SET lease_until=now()+($2 * interval '1 second'),last_error='transient processing error' WHERE id=$1 AND processed_at IS NULL`, e.id, int64(backoff.Seconds()))
 			if releaseErr != nil {

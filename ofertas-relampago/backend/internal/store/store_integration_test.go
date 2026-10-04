@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -313,5 +314,51 @@ func TestRetryBackoffIsBounded(t *testing.T) {
 		if got := retryBackoff(attempt); got != want {
 			t.Errorf("retryBackoff(%d)=%s want %s", attempt, got, want)
 		}
+	}
+}
+
+func TestTransientWorkerFailureSchedulesRetryAndThenProcesses(t *testing.T) {
+	s := integrationStore(t)
+	order, err := s.CreateOrder(context.Background(), offerID(t)+"-retry", offerID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID, eventKey := testID(t), "retry-event-"+testID(t)
+	if inserted, err := s.PersistPaidEvent(context.Background(), eventID, order.ID, eventKey); err != nil || !inserted {
+		t.Fatalf("persist event inserted=%v err=%v", inserted, err)
+	}
+	processed, err := s.processPaymentEvents(context.Background(), 10, func(context.Context, string, string) error { return fmt.Errorf("temporary injected failure") })
+	if processed != 0 || err == nil {
+		t.Fatalf("failed pass processed=%d err=%v", processed, err)
+	}
+	var attempts int
+	var lastError string
+	var leaseUntil time.Time
+	if err := s.pool.QueryRow(context.Background(), `SELECT attempts,last_error,lease_until FROM payment_events WHERE id=$1`, eventID).Scan(&attempts, &lastError, &leaseUntil); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 1 || lastError == "" || !leaseUntil.After(time.Now()) {
+		t.Fatalf("attempts=%d last_error=%q lease_until=%s", attempts, lastError, leaseUntil)
+	}
+	if _, err := s.pool.Exec(context.Background(), `UPDATE payment_events SET lease_until=now()-interval '1 second' WHERE id=$1`, eventID); err != nil {
+		t.Fatal(err)
+	}
+	processed, err = s.ProcessPaymentEvents(context.Background(), 10)
+	if processed != 1 || err != nil {
+		t.Fatalf("retry pass processed=%d err=%v", processed, err)
+	}
+	var finished bool
+	if err := s.pool.QueryRow(context.Background(), `SELECT processed_at IS NOT NULL AND lease_until IS NULL AND last_error IS NULL AND attempts=2 FROM payment_events WHERE id=$1`, eventID).Scan(&finished); err != nil {
+		t.Fatal(err)
+	}
+	if !finished {
+		t.Fatal("retry did not finish and clear lease/error")
+	}
+	paid, err := s.GetOrder(context.Background(), order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paid.State != "paid" {
+		t.Fatalf("order state after retry=%s", paid.State)
 	}
 }
