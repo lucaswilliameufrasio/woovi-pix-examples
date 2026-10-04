@@ -66,6 +66,10 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		writeValidationError(w, "order_id", "deve ser informado")
 		return
 	}
+	if len(in.OrderID) > 200 {
+		writeValidationError(w, "order_id", "deve ter no máximo 200 caracteres")
+		return
+	}
 	if strings.TrimSpace(in.OrderID) != in.OrderID {
 		writeValidationError(w, "order_id", "não deve conter espaços no início ou no fim")
 		return
@@ -110,9 +114,30 @@ func (s *Server) pay(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "UNEXPECTED_ERROR")
 		return
 	}
+	if charge.AlreadyPaid {
+		if charge.OrderState == "paid" || charge.OrderState == "payment_exception" {
+			writeConflictError(w, "ORDER_NOT_ELIGIBLE", map[string]any{"order_state": charge.OrderState})
+			return
+		}
+		delivered, err := s.store.HasPaidEvent(r.Context(), charge.OrderID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "UNEXPECTED_ERROR")
+			return
+		}
+		if !delivered && (s.deliver == nil || s.deliver(charge.OrderID, "paid:"+charge.OrderID) != nil) {
+			writeError(w, http.StatusBadGateway, "DEPENDENCY_REQUEST")
+			return
+		}
+		write(w, map[string]string{"status": "webhook already accepted"})
+		return
+	}
 	order, err := s.store.GetOrder(r.Context(), charge.OrderID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "UNEXPECTED_ERROR")
+		return
+	}
+	if order.State == "paid" || order.State == "payment_exception" {
+		writePreconditionError(w, "ORDER_NOT_ELIGIBLE", map[string]any{"order_state": order.State})
 		return
 	}
 	if s.deliver == nil || s.deliver(charge.OrderID, "paid:"+charge.OrderID) != nil {
@@ -151,6 +176,10 @@ func (s *Server) scenario(w http.ResponseWriter, r *http.Request) {
 		orderID := r.URL.Query().Get("order_id")
 		if orderID == "" {
 			writeValidationError(w, "order_id", "deve ser informado")
+			return
+		}
+		if len(orderID) > 200 {
+			writeValidationError(w, "order_id", "deve ter no máximo 200 caracteres")
 			return
 		}
 		amount, err := s.lookup(orderID)
@@ -192,22 +221,23 @@ func write(w http.ResponseWriter, v any) {
 
 func writeError(w http.ResponseWriter, status int, code string) {
 	messages := map[string]string{
-		"MALFORMED_REQUEST":          "A requisição está malformada.",
-		"INVALID_PARAMS":             "Parâmetros inválidos.",
-		"ORDER_NOT_FOUND":            "Pedido não encontrado.",
-		"CHARGE_NOT_FOUND":           "Cobrança não encontrada.",
-		"IDEMPOTENCY_CONFLICT":       "A chave de idempotência conflita com uma cobrança existente.",
-		"PAYMENT_SIMULATOR_DELIVERY": "Não foi possível entregar o evento ao backend local.",
-		"DEPENDENCY_REQUEST":         "Não foi possível concluir a solicitação a uma dependência.",
-		"SIMULATED_TIMEOUT":          "Timeout simulado após persistir a cobrança; consulte ou repita usando a mesma referência.",
-		"SIMULATED_RATE_LIMIT":       "Limite simulado; tente novamente após o intervalo informado.",
-		"SCENARIO_NOT_FOUND":         "Cenário não encontrado.",
-		"PAYLOAD_TOO_LARGE":          "O corpo da requisição excede o limite permitido.",
-		"UNEXPECTED_ERROR":           "Ocorreu um erro inesperado.",
+		"MALFORMED_REQUEST":    "A requisição está malformada.",
+		"INVALID_PARAMS":       "Parâmetros inválidos.",
+		"ORDER_NOT_FOUND":      "Pedido não encontrado.",
+		"CHARGE_NOT_FOUND":     "Cobrança não encontrada.",
+		"IDEMPOTENCY_CONFLICT": "A chave de idempotência conflita com uma cobrança existente.",
+		"OFFER_UNAVAILABLE":    "A oferta não está disponível.",
+		"ORDER_NOT_ELIGIBLE":   "O pedido não permite esta operação no estado atual.",
+		"DEPENDENCY_REQUEST":   "Não foi possível concluir a solicitação a uma dependência.",
+		"SIMULATED_TIMEOUT":    "Timeout simulado após persistir a cobrança; consulte ou repita usando a mesma referência.",
+		"SIMULATED_RATE_LIMIT": "Limite simulado; tente novamente após o intervalo informado.",
+		"SCENARIO_NOT_FOUND":   "Cenário não encontrado.",
+		"PAYLOAD_TOO_LARGE":    "O corpo da requisição excede o limite permitido.",
+		"UNEXPECTED_ERROR":     "Ocorreu um erro inesperado.",
 	}
 	message, ok := messages[code]
 	if !ok || status >= http.StatusInternalServerError && status != http.StatusGatewayTimeout && status != http.StatusBadGateway {
-		code, message = "UNEXPECTED_ERROR", "Ocorreu um erro inesperado."
+		status, code, message = http.StatusInternalServerError, "UNEXPECTED_ERROR", "Ocorreu um erro inesperado."
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -224,11 +254,26 @@ func writeValidationError(w http.ResponseWriter, field, message string) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"message": "Parâmetros inválidos.", "error_code": "INVALID_PARAMS", "extra": map[string]any{"validation_errors": []map[string]string{{"field": field, "message": message}}}})
 }
 
+func writePreconditionError(w http.ResponseWriter, code string, extra map[string]any) {
+	message := "O pedido não permite esta operação no estado atual."
+	if code == "OFFER_UNAVAILABLE" {
+		message = "A oferta não está disponível."
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusPreconditionFailed)
+	_ = json.NewEncoder(w).Encode(map[string]any{"message": message, "error_code": code, "extra": extra})
+}
+
+func writeConflictError(w http.ResponseWriter, code string, extra map[string]any) {
+	message := "O pedido não permite esta operação no estado atual."
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusConflict)
+	_ = json.NewEncoder(w).Encode(map[string]any{"message": message, "error_code": code, "extra": extra})
+}
+
 func writeDecodeError(w http.ResponseWriter, err error) {
 	var maxBytesError *http.MaxBytesError
 	if errors.As(err, &maxBytesError) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusRequestEntityTooLarge)
 		writeError(w, http.StatusRequestEntityTooLarge, "PAYLOAD_TOO_LARGE")
 		return
 	}

@@ -3,6 +3,7 @@ package httpapi
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -24,15 +25,21 @@ type apiError struct {
 }
 
 var errorMessages = map[string]string{
-	"MALFORMED_REQUEST":    "A requisição está malformada.",
-	"UNEXPECTED_ERROR":     "Ocorreu um erro inesperado.",
-	"PAYLOAD_TOO_LARGE":    "O corpo da requisição excede o limite permitido.",
-	"DEPENDENCY_REQUEST":   "Não foi possível concluir a solicitação a uma dependência.",
-	"INVALID_PARAMS":       "Parâmetros inválidos.",
-	"OFFER_UNAVAILABLE":    "A oferta não está disponível.",
-	"ORDER_NOT_FOUND":      "Pedido não encontrado.",
-	"IDEMPOTENCY_CONFLICT": "A chave de idempotência já foi usada com outros dados.",
-	"NOT_FOUND":            "Recurso não encontrado.",
+	"MALFORMED_REQUEST":     "A requisição está malformada.",
+	"UNEXPECTED_ERROR":      "Ocorreu um erro inesperado.",
+	"PAYLOAD_TOO_LARGE":     "O corpo da requisição excede o limite permitido.",
+	"DEPENDENCY_REQUEST":    "Não foi possível concluir a solicitação a uma dependência.",
+	"INVALID_PARAMS":        "Parâmetros inválidos.",
+	"OFFER_UNAVAILABLE":     "A oferta não está disponível.",
+	"OFFER_NOT_FOUND":       "Oferta não encontrada.",
+	"ORDER_NOT_FOUND":       "Pedido não encontrado.",
+	"ORDER_NOT_ELIGIBLE":    "O pedido não permite esta operação no estado atual.",
+	"OPERATOR_UNAUTHORIZED": "Autenticação do operador inválida.",
+	"PICKUP_NOT_ELIGIBLE":   "O pedido ainda não está apto para retirada.",
+	"PICKUP_ALREADY_DONE":   "A retirada deste pedido já foi concluída.",
+	"PICKUP_TOKEN_INVALID":  "O código de retirada é inválido.",
+	"IDEMPOTENCY_CONFLICT":  "A chave de idempotência já foi usada com outros dados.",
+	"NOT_FOUND":             "Recurso não encontrado.",
 }
 
 func (a API) Handler() http.Handler {
@@ -50,12 +57,36 @@ func (a API) Handler() http.Handler {
 	})
 	mux.HandleFunc("POST /v1/orders", a.createOrder)
 	mux.HandleFunc("GET /v1/orders/{order_id}", a.getOrder)
-	mux.HandleFunc("GET /v1/operator/orders", a.listOrders)
-	mux.HandleFunc("POST /v1/operator/demo/reset", a.resetDemo)
+	mux.Handle("GET /v1/operator/orders", a.operatorOnly(a.listOrders))
+	mux.Handle("POST /v1/operator/orders/{order_id}/paid", a.operatorOnly(a.markOrderPaid))
+	mux.Handle("POST /v1/operator/orders/{order_id}/pickup-token", a.operatorOnly(a.issuePickupToken))
+	mux.Handle("POST /v1/operator/orders/{order_id}/pickup", a.operatorOnly(a.redeemPickup))
+	mux.Handle("POST /v1/operator/demo/reset", a.operatorOnly(a.resetDemo))
 	if os.Getenv("DEMO_MODE") == "true" {
 		mux.HandleFunc("POST /v1/dev/webhooks/paid", a.paidWebhook)
 	}
 	return mux
+}
+
+func (a API) operatorOnly(next http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if os.Getenv("DEMO_MODE") != "true" {
+			writeError(w, http.StatusNotFound, "NOT_FOUND")
+			return
+		}
+		expected := os.Getenv("DEMO_OPERATOR_TOKEN")
+		if len(expected) < 32 {
+			writeError(w, http.StatusInternalServerError, "UNEXPECTED_ERROR")
+			return
+		}
+		const prefix = "Bearer "
+		provided := r.Header.Get("Authorization")
+		if len(provided) < len(prefix) || provided[:len(prefix)] != prefix || subtle.ConstantTimeCompare([]byte(provided[len(prefix):]), []byte(expected)) != 1 {
+			writeError(w, http.StatusUnauthorized, "OPERATOR_UNAUTHORIZED")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (a API) createOrder(w http.ResponseWriter, r *http.Request) {
@@ -81,6 +112,10 @@ func (a API) createOrder(w http.ResponseWriter, r *http.Request) {
 		writeValidationError(w, "offer_id", "deve ser informado")
 		return
 	}
+	if len(input.OfferID) > 200 {
+		writeValidationError(w, "offer_id", "deve ter no máximo 200 caracteres")
+		return
+	}
 	id, err := newID()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "UNEXPECTED_ERROR")
@@ -88,7 +123,11 @@ func (a API) createOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	order, err := a.Store.CreateOrder(r.Context(), id, input.OfferID)
 	if errors.Is(err, store.ErrUnavailable) {
-		writeError(w, http.StatusConflict, "OFFER_UNAVAILABLE")
+		writeError(w, http.StatusPreconditionFailed, "OFFER_UNAVAILABLE")
+		return
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "OFFER_NOT_FOUND")
 		return
 	}
 	if err != nil {
@@ -111,6 +150,10 @@ func (a API) getOrder(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, o)
 }
 func (a API) listOrders(w http.ResponseWriter, r *http.Request) {
+	if os.Getenv("DEMO_MODE") != "true" {
+		writeError(w, http.StatusNotFound, "NOT_FOUND")
+		return
+	}
 	orders, err := a.Store.ListOrders(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "UNEXPECTED_ERROR")
@@ -118,6 +161,121 @@ func (a API) listOrders(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, orders)
 }
+
+func (a API) issuePickupToken(w http.ResponseWriter, r *http.Request) {
+	if os.Getenv("DEMO_MODE") != "true" {
+		writeError(w, http.StatusNotFound, "NOT_FOUND")
+		return
+	}
+	token, err := a.Store.IssuePickupCredential(r.Context(), r.PathValue("order_id"))
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "ORDER_NOT_FOUND")
+		return
+	}
+	if errors.Is(err, store.ErrPickupNotEligible) {
+		writeError(w, http.StatusPreconditionFailed, "PICKUP_NOT_ELIGIBLE")
+		return
+	}
+	if errors.Is(err, store.ErrPickupAlreadyCompleted) {
+		writeError(w, http.StatusConflict, "PICKUP_ALREADY_DONE")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "UNEXPECTED_ERROR")
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"pickup_token": token})
+}
+
+func (a API) redeemPickup(w http.ResponseWriter, r *http.Request) {
+	if os.Getenv("DEMO_MODE") != "true" {
+		writeError(w, http.StatusNotFound, "NOT_FOUND")
+		return
+	}
+	if err := requireJSON(r); err != nil {
+		writeError(w, http.StatusBadRequest, "MALFORMED_REQUEST")
+		return
+	}
+	var input struct {
+		PickupToken string `json:"pickup_token"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeDecodeError(w, err)
+		return
+	}
+	if input.PickupToken == "" {
+		writeValidationError(w, "pickup_token", "deve ser informado")
+		return
+	}
+	order, err := a.Store.RedeemPickupCredential(r.Context(), r.PathValue("order_id"), input.PickupToken)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "ORDER_NOT_FOUND")
+		return
+	}
+	if errors.Is(err, store.ErrPickupNotEligible) {
+		writeError(w, http.StatusPreconditionFailed, "PICKUP_NOT_ELIGIBLE")
+		return
+	}
+	if errors.Is(err, store.ErrPickupAlreadyCompleted) {
+		writeError(w, http.StatusConflict, "PICKUP_ALREADY_DONE")
+		return
+	}
+	if errors.Is(err, store.ErrPickupCredentialInvalid) {
+		writeError(w, http.StatusConflict, "PICKUP_TOKEN_INVALID")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "UNEXPECTED_ERROR")
+		return
+	}
+	writeJSON(w, http.StatusOK, order)
+}
+
+func (a API) markOrderPaid(w http.ResponseWriter, r *http.Request) {
+	if os.Getenv("DEMO_MODE") != "true" {
+		writeError(w, http.StatusNotFound, "NOT_FOUND")
+		return
+	}
+	order, err := a.Store.MarkPaid(r.Context(), r.PathValue("order_id"))
+	var stateConflict store.ErrOrderStateConflict
+	if errors.As(err, &stateConflict) {
+		writeConflictError(w, "ORDER_NOT_ELIGIBLE", map[string]any{"order_state": stateConflict.State})
+		return
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "ORDER_NOT_FOUND")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "UNEXPECTED_ERROR")
+		return
+	}
+	writeJSON(w, http.StatusOK, order)
+}
+
+func writePreconditionError(w http.ResponseWriter, code string, extra map[string]any) {
+	message, ok := errorMessages[code]
+	if !ok {
+		code, message = "UNEXPECTED_ERROR", "Ocorreu um erro inesperado."
+	}
+	writeJSON(w, http.StatusPreconditionFailed, apiError{Message: message, ErrorCode: code, Extra: extra})
+}
+
+func writeConflictError(w http.ResponseWriter, code string, extra map[string]any) {
+	message, ok := errorMessages[code]
+	if !ok {
+		code, message = "UNEXPECTED_ERROR", "Ocorreu um erro inesperado."
+	}
+	writeJSON(w, http.StatusConflict, apiError{Message: message, ErrorCode: code, Extra: extra})
+}
+
 func (a API) resetDemo(w http.ResponseWriter, r *http.Request) {
 	if os.Getenv("DEMO_MODE") != "true" {
 		writeError(w, http.StatusNotFound, "NOT_FOUND")
@@ -162,12 +320,19 @@ func (a API) paidWebhook(w http.ResponseWriter, r *http.Request) {
 		writeValidationError(w, field, "deve ser informado")
 		return
 	}
-	if _, err := a.Store.GetOrder(r.Context(), in.OrderID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			writeError(w, http.StatusNotFound, "ORDER_NOT_FOUND")
-		} else {
-			writeError(w, http.StatusInternalServerError, "UNEXPECTED_ERROR")
-		}
+	if len(in.OrderID) > 200 {
+		writeValidationError(w, "order_id", "deve ter no máximo 200 caracteres")
+		return
+	}
+	if len(in.EventKey) > 200 {
+		writeValidationError(w, "event_key", "deve ter no máximo 200 caracteres")
+		return
+	}
+	if _, err := a.Store.GetOrder(r.Context(), in.OrderID); errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "ORDER_NOT_FOUND")
+		return
+	} else if err != nil {
+		writeError(w, http.StatusInternalServerError, "UNEXPECTED_ERROR")
 		return
 	}
 	sum := sha256.Sum256([]byte(in.EventKey))

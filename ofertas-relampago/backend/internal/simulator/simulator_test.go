@@ -80,7 +80,16 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 		}
 		return nil
 	}
-	sim := httptest.NewServer(New(st, lookup, deliver).Handler())
+	var rejectDelivery bool
+	var deliveryAttempts int
+	failedDeliver := func(id, eventKey string) error {
+		deliveryAttempts++
+		if rejectDelivery {
+			return fmt.Errorf("temporary local delivery failure")
+		}
+		return deliver(id, eventKey)
+	}
+	sim := httptest.NewServer(New(st, lookup, failedDeliver).Handler())
 	defer sim.Close()
 	chargeBody, _ := json.Marshal(map[string]string{"order_id": order.ID})
 	resp, err := client.Post(sim.URL+"/v1/charges", "application/json", bytes.NewReader(chargeBody))
@@ -95,6 +104,23 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || charge.AmountCents != 1999 {
 		t.Fatalf("charge=%+v status=%d", charge, resp.StatusCode)
 	}
+	rejectDelivery = true
+	resp, err = client.Post(sim.URL+"/v1/charges/"+order.ID+"/pay", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failedDelivery map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&failedDelivery); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway || failedDelivery["error_code"] != "DEPENDENCY_REQUEST" {
+		t.Fatalf("failed delivery status=%d body=%v", resp.StatusCode, failedDelivery)
+	}
+	if deliveryAttempts != 1 {
+		t.Fatalf("delivery attempts after failure=%d, want 1", deliveryAttempts)
+	}
+	rejectDelivery = false
 	for _, body := range []string{`{"orderID":"` + order.ID + `"}`, `{"order_id":`} {
 		resp, err = client.Post(sim.URL+"/v1/charges", "application/json", strings.NewReader(body))
 		if err != nil {
@@ -141,7 +167,7 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 	}
 	sim.Close()
 	// A fresh simulator process reads the same durable charge from PostgreSQL.
-	sim = httptest.NewServer(New(st, lookup, deliver).Handler())
+	sim = httptest.NewServer(New(st, lookup, failedDeliver).Handler())
 	defer sim.Close()
 	resp, err = client.Get(sim.URL + "/v1/charges/" + order.ID)
 	if err != nil {
@@ -162,6 +188,18 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("pay status=%d", resp.StatusCode)
+	}
+	resp, err = client.Post(sim.URL+"/v1/charges/"+order.ID+"/pay", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var duplicatePayError map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&duplicatePayError); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || duplicatePayError["status"] != "webhook already accepted" {
+		t.Fatalf("duplicate pay status=%d body=%v", resp.StatusCode, duplicatePayError)
 	}
 	resp, err = client.Post(sim.URL+"/v1/dev/scenarios/duplicate_paid/"+order.ID, "application/json", nil)
 	if err != nil {
@@ -185,6 +223,13 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 	}
 	if paidCharge.OrderState != "pending_payment" {
 		t.Fatalf("order state before worker=%s, want pending_payment", paidCharge.OrderState)
+	}
+	var persistedEvents int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM payment_events WHERE order_id=$1`, order.ID).Scan(&persistedEvents); err != nil {
+		t.Fatal(err)
+	}
+	if persistedEvents == 0 {
+		t.Fatalf("payment event disappeared before worker processing for order %s", order.ID)
 	}
 	if _, err := st.ProcessPaymentEvents(ctx, 10); err != nil {
 		t.Fatal(err)

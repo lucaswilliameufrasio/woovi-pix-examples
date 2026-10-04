@@ -2,6 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -13,6 +16,15 @@ import (
 var ErrUnavailable = errors.New("offer unavailable")
 var ErrEventKeyConflict = errors.New("event key already belongs to another order")
 var ErrChargeConflict = errors.New("charge order already has a different amount")
+var ErrOrderNotPayable = errors.New("order is already in a terminal payment state")
+var ErrPickupNotEligible = errors.New("order is not eligible for pickup")
+var ErrPickupAlreadyCompleted = errors.New("order pickup is already completed")
+var ErrPickupCredentialInvalid = errors.New("pickup credential is invalid")
+
+type ErrOrderStateConflict struct{ State string }
+
+func (e ErrOrderStateConflict) Error() string        { return ErrOrderNotPayable.Error() }
+func (e ErrOrderStateConflict) Is(target error) bool { return target == ErrOrderNotPayable }
 
 type Offer struct {
 	ID                   string `json:"id"`
@@ -23,11 +35,12 @@ type Offer struct {
 }
 
 type Order struct {
-	ID        string    `json:"id"`
-	OfferID   string    `json:"offer_id"`
-	Amount    int64     `json:"amount_cents"`
-	State     string    `json:"state"`
-	ExpiresAt time.Time `json:"expires_at"`
+	ID         string     `json:"id"`
+	OfferID    string     `json:"offer_id"`
+	Amount     int64      `json:"amount_cents"`
+	State      string     `json:"state"`
+	ExpiresAt  time.Time  `json:"expires_at"`
+	PickedUpAt *time.Time `json:"picked_up_at,omitempty"`
 }
 
 type SimulatedCharge struct {
@@ -36,6 +49,7 @@ type SimulatedCharge struct {
 	AmountCents int64  `json:"amount_cents"`
 	Status      string `json:"status"`
 	OrderState  string `json:"order_state"`
+	AlreadyPaid bool   `json:"-"`
 }
 
 type Store struct{ pool *pgxpool.Pool }
@@ -61,7 +75,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 		reservation_ttl_seconds integer NOT NULL CHECK (reservation_ttl_seconds > 0), created_at timestamptz NOT NULL DEFAULT now());
 		CREATE TABLE IF NOT EXISTS orders (
 		id text PRIMARY KEY, offer_id text NOT NULL REFERENCES offers(id), amount_cents bigint NOT NULL CHECK (amount_cents > 0),
-		state text NOT NULL CHECK (state IN ('pending_payment','paid','expired','payment_exception')), expires_at timestamptz NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
+		state text NOT NULL CHECK (state IN ('pending_payment','paid','expired','payment_exception')), expires_at timestamptz NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), pickup_token_hash text, picked_up_at timestamptz);
 		CREATE INDEX IF NOT EXISTS orders_expiring_idx ON orders(expires_at) WHERE state='pending_payment';
 		CREATE TABLE IF NOT EXISTS payment_events(id text PRIMARY KEY,order_id text NOT NULL REFERENCES orders(id),event_type text NOT NULL CHECK(event_type='paid'),event_key text NOT NULL UNIQUE,received_at timestamptz NOT NULL DEFAULT now(),processed_at timestamptz,lease_until timestamptz,attempts integer NOT NULL DEFAULT 0,last_error text);
 		CREATE INDEX IF NOT EXISTS payment_events_pending_idx ON payment_events(received_at) WHERE processed_at IS NULL;`
@@ -77,6 +91,23 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := tx.Exec(ctx, schema); err != nil {
 		_ = tx.Rollback(ctx)
 		return fmt.Errorf("migrate schema: %w", err)
+	}
+	var hasPickupHash, hasPickedUpAt bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='orders' AND column_name='pickup_token_hash'), EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='orders' AND column_name='picked_up_at')`).Scan(&hasPickupHash, &hasPickedUpAt); err != nil {
+		_ = tx.Rollback(ctx)
+		return fmt.Errorf("check pickup schema: %w", err)
+	}
+	if !hasPickupHash {
+		if _, err := tx.Exec(ctx, `ALTER TABLE orders ADD COLUMN pickup_token_hash text`); err != nil {
+			_ = tx.Rollback(ctx)
+			return fmt.Errorf("migrate pickup credential hash: %w", err)
+		}
+	}
+	if !hasPickedUpAt {
+		if _, err := tx.Exec(ctx, `ALTER TABLE orders ADD COLUMN picked_up_at timestamptz`); err != nil {
+			_ = tx.Rollback(ctx)
+			return fmt.Errorf("migrate pickup timestamp: %w", err)
+		}
 	}
 	if _, err := tx.Exec(ctx, simulatedChargesSchema); err != nil {
 		_ = tx.Rollback(ctx)
@@ -119,6 +150,13 @@ func (s *Store) CreateOrder(ctx context.Context, id, offerID string) (Order, err
 	defer func() { _ = tx.Rollback(ctx) }()
 	var price int64
 	var ttl int
+	var offerExists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM offers WHERE id=$1)`, offerID).Scan(&offerExists); err != nil {
+		return Order{}, err
+	}
+	if !offerExists {
+		return Order{}, pgx.ErrNoRows
+	}
 	err = tx.QueryRow(ctx, `UPDATE offers SET available_units=available_units-1 WHERE id=$1 AND available_units > 0 RETURNING price_cents,reservation_ttl_seconds`, offerID).Scan(&price, &ttl)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Order{}, ErrUnavailable
@@ -198,7 +236,7 @@ func (s *Store) MarkPaid(ctx context.Context, id string) (Order, error) {
 		return Order{}, err
 	}
 	if state == "paid" || state == "payment_exception" {
-		return Order{}, pgx.ErrNoRows
+		return Order{}, ErrOrderStateConflict{State: state}
 	}
 	newState := "paid"
 	if state == "expired" || !expiresAt.After(now) {
@@ -222,12 +260,68 @@ func (s *Store) MarkPaid(ctx context.Context, id string) (Order, error) {
 
 func (s *Store) GetOrder(ctx context.Context, id string) (Order, error) {
 	var o Order
-	err := s.pool.QueryRow(ctx, `SELECT id,offer_id,amount_cents,state,expires_at FROM orders WHERE id=$1`, id).Scan(&o.ID, &o.OfferID, &o.Amount, &o.State, &o.ExpiresAt)
+	err := s.pool.QueryRow(ctx, `SELECT id,offer_id,amount_cents,state,expires_at,picked_up_at FROM orders WHERE id=$1`, id).Scan(&o.ID, &o.OfferID, &o.Amount, &o.State, &o.ExpiresAt, &o.PickedUpAt)
 	return o, err
 }
 
+func (s *Store) IssuePickupCredential(ctx context.Context, orderID string) (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(raw[:])
+	hash := sha256.Sum256([]byte(token))
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var state string
+	var pickedUpAt *time.Time
+	if err := tx.QueryRow(ctx, `SELECT state,picked_up_at FROM orders WHERE id=$1 FOR UPDATE`, orderID).Scan(&state, &pickedUpAt); err != nil {
+		return "", err
+	}
+	if state != "paid" {
+		return "", ErrPickupNotEligible
+	}
+	if pickedUpAt != nil {
+		return "", ErrPickupAlreadyCompleted
+	}
+	if _, err := tx.Exec(ctx, `UPDATE orders SET pickup_token_hash=$2 WHERE id=$1`, orderID, hex.EncodeToString(hash[:])); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func (s *Store) RedeemPickupCredential(ctx context.Context, orderID, token string) (Order, error) {
+	hash := sha256.Sum256([]byte(token))
+	var order Order
+	err := s.pool.QueryRow(ctx, `UPDATE orders SET picked_up_at=now(),pickup_token_hash=NULL WHERE id=$1 AND state='paid' AND picked_up_at IS NULL AND pickup_token_hash=$2 RETURNING id,offer_id,amount_cents,state,expires_at,picked_up_at`, orderID, hex.EncodeToString(hash[:])).Scan(&order.ID, &order.OfferID, &order.Amount, &order.State, &order.ExpiresAt, &order.PickedUpAt)
+	if err == nil {
+		return order, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return Order{}, err
+	}
+	var state string
+	var pickedUpAt *time.Time
+	if err := s.pool.QueryRow(ctx, `SELECT state,picked_up_at FROM orders WHERE id=$1`, orderID).Scan(&state, &pickedUpAt); err != nil {
+		return Order{}, err
+	}
+	if pickedUpAt != nil {
+		return Order{}, ErrPickupAlreadyCompleted
+	}
+	if state != "paid" {
+		return Order{}, ErrPickupNotEligible
+	}
+	return Order{}, ErrPickupCredentialInvalid
+}
+
 func (s *Store) ListOrders(ctx context.Context) ([]Order, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id,offer_id,amount_cents,state,expires_at FROM orders ORDER BY created_at,id`)
+	rows, err := s.pool.Query(ctx, `SELECT id,offer_id,amount_cents,state,expires_at,picked_up_at FROM orders ORDER BY created_at,id`)
 	if err != nil {
 		return nil, err
 	}
@@ -235,7 +329,7 @@ func (s *Store) ListOrders(ctx context.Context) ([]Order, error) {
 	var result []Order
 	for rows.Next() {
 		var o Order
-		if err := rows.Scan(&o.ID, &o.OfferID, &o.Amount, &o.State, &o.ExpiresAt); err != nil {
+		if err := rows.Scan(&o.ID, &o.OfferID, &o.Amount, &o.State, &o.ExpiresAt, &o.PickedUpAt); err != nil {
 			return nil, err
 		}
 		result = append(result, o)
@@ -261,7 +355,7 @@ func (s *Store) ResetDemo(ctx context.Context) error {
 	return tx.Commit(ctx)
 }
 
-func (s *Store) PersistPaidEvent(ctx context.Context, id, orderID, eventKey string) (bool, error) {
+func (s *Store) PersistPaidEvent(ctx context.Context, id, orderID, eventKey string) (created bool, err error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return false, err
@@ -271,7 +365,7 @@ func (s *Store) PersistPaidEvent(ctx context.Context, id, orderID, eventKey stri
 	if err != nil {
 		return false, err
 	}
-	created := tag.RowsAffected() == 1
+	created = tag.RowsAffected() == 1
 	var existingOrderID string
 	if err := tx.QueryRow(ctx, `SELECT order_id FROM payment_events WHERE event_key=$1`, eventKey).Scan(&existingOrderID); err != nil {
 		return false, err
@@ -283,6 +377,12 @@ func (s *Store) PersistPaidEvent(ctx context.Context, id, orderID, eventKey stri
 		return false, err
 	}
 	return created, nil
+}
+
+func (s *Store) HasPaidEvent(ctx context.Context, orderID string) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM payment_events WHERE order_id=$1 AND event_type='paid')`, orderID).Scan(&exists)
+	return exists, err
 }
 
 func (s *Store) CreateSimulatedCharge(ctx context.Context, orderID string, amount int64) (SimulatedCharge, error) {
@@ -311,10 +411,11 @@ func (s *Store) MarkSimulatedChargePaid(ctx context.Context, orderID string) (Si
 	err := s.pool.QueryRow(ctx, `UPDATE simulated_charges SET status='paid',updated_at=now() WHERE order_id=$1 AND status='pending' RETURNING charge_id,order_id,amount_cents,status`, orderID).Scan(&c.ID, &c.OrderID, &c.AmountCents, &c.Status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		c, err = s.GetSimulatedCharge(ctx, orderID)
+		if err == nil && c.Status == "paid" {
+			c.AlreadyPaid = true
+		}
 	} else if err == nil {
-		var order Order
-		order, err = s.GetOrder(ctx, orderID)
-		c.OrderState = order.State
+		c, err = s.GetSimulatedCharge(ctx, orderID)
 	}
 	return c, err
 }
@@ -396,6 +497,9 @@ func (s *Store) processPaymentEvent(ctx context.Context, eventID, orderID string
 	defer func() { _ = tx.Rollback(ctx) }()
 	var processedAt *time.Time
 	if err := tx.QueryRow(ctx, `SELECT processed_at FROM payment_events WHERE id=$1 FOR UPDATE`, eventID).Scan(&processedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
 		return err
 	}
 	if processedAt != nil {

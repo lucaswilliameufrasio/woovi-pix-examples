@@ -36,6 +36,10 @@ func main() {
 		slog.Error("this backend currently supports the local simulator only; set DEMO_MODE=true for local use")
 		os.Exit(1)
 	}
+	if len(os.Getenv("DEMO_OPERATOR_TOKEN")) < 32 {
+		slog.Error("DEMO_OPERATOR_TOKEN must contain at least 32 characters; generate and configure a local secret")
+		os.Exit(1)
+	}
 	apiServer := &http.Server{Handler: (httpapi.API{Store: st}).Handler(), ReadHeaderTimeout: 5 * time.Second}
 	simServer := &http.Server{Handler: simulatorHandler(st), ReadHeaderTimeout: 5 * time.Second}
 	apiAddr := env("API_ADDR", "127.0.0.1:8080")

@@ -18,6 +18,8 @@ import (
 
 func TestOrderRoutesAgainstPostgres(t *testing.T) {
 	t.Setenv("DEMO_MODE", "true")
+	operatorToken := "local-test-operator-token-0123456789abcdef"
+	t.Setenv("DEMO_OPERATOR_TOKEN", operatorToken)
 	dbURL := os.Getenv("TEST_DATABASE_URL")
 	if dbURL == "" {
 		t.Skip("TEST_DATABASE_URL is required for PostgreSQL integration tests")
@@ -63,6 +65,13 @@ func TestOrderRoutesAgainstPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	orderID = created.ID
+	missingOfferReq := httptest.NewRequest(http.MethodPost, "/v1/orders", strings.NewReader(`{"offer_id":"missing-`+testUnique(t)+`"}`))
+	missingOfferReq.Header.Set("Content-Type", "application/json")
+	missingOfferRec := httptest.NewRecorder()
+	handler.ServeHTTP(missingOfferRec, missingOfferReq)
+	if missingOfferRec.Code != http.StatusNotFound || !strings.Contains(missingOfferRec.Body.String(), `"error_code":"OFFER_NOT_FOUND"`) {
+		t.Fatalf("missing offer status=%d body=%s", missingOfferRec.Code, missingOfferRec.Body.String())
+	}
 	var persisted int64
 	if err := pool.QueryRow(ctx, `SELECT amount_cents FROM orders WHERE id=$1`, orderID).Scan(&persisted); err != nil {
 		t.Fatal(err)
@@ -98,6 +107,14 @@ func TestOrderRoutesAgainstPostgres(t *testing.T) {
 	if rec.Code != http.StatusUnprocessableEntity || !strings.Contains(rec.Body.String(), `"error_code":"INVALID_PARAMS"`) || !strings.Contains(rec.Body.String(), `"validation_errors"`) {
 		t.Fatalf("semantic validation status=%d body=%s", rec.Code, rec.Body.String())
 	}
+	invalidOffer := `{"offer_id":"` + strings.Repeat("x", 201) + `"}`
+	req = httptest.NewRequest(http.MethodPost, "/v1/orders", strings.NewReader(invalidOffer))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnprocessableEntity || !strings.Contains(rec.Body.String(), `"error_code":"INVALID_PARAMS"`) || !strings.Contains(rec.Body.String(), `"field":"offer_id"`) {
+		t.Fatalf("invalid resource identifier status=%d body=%s", rec.Code, rec.Body.String())
+	}
 	req = httptest.NewRequest(http.MethodPost, "/v1/orders", bytes.NewBufferString(`{"offer_id":`))
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
@@ -109,7 +126,7 @@ func TestOrderRoutesAgainstPostgres(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusConflict {
+	if rec.Code != http.StatusPreconditionFailed {
 		t.Fatalf("oversell status=%d", rec.Code)
 	}
 	if !strings.Contains(rec.Body.String(), `"error_code":"OFFER_UNAVAILABLE"`) || !strings.Contains(rec.Body.String(), `"message":`) {
@@ -148,6 +165,92 @@ func TestOrderRoutesAgainstPostgres(t *testing.T) {
 	if events != 1 {
 		t.Fatalf("duplicate persisted event count=%d", events)
 	}
+	paidRequest := httptest.NewRequest(http.MethodPost, "/v1/operator/orders/"+orderID+"/paid", nil)
+	paidRequest.Header.Set("Authorization", "Bearer "+operatorToken)
+	paidResponse := httptest.NewRecorder()
+	handler.ServeHTTP(paidResponse, paidRequest)
+	if paidResponse.Code != http.StatusOK {
+		t.Fatalf("mark paid status=%d body=%s", paidResponse.Code, paidResponse.Body.String())
+	}
+	paidResponse = httptest.NewRecorder()
+	handler.ServeHTTP(paidResponse, paidRequest)
+	if paidResponse.Code != http.StatusConflict || !strings.Contains(paidResponse.Body.String(), `"error_code":"ORDER_NOT_ELIGIBLE"`) || !strings.Contains(paidResponse.Body.String(), `"order_state":"paid"`) {
+		t.Fatalf("repeat paid transition status=%d body=%s", paidResponse.Code, paidResponse.Body.String())
+	}
+	issueRequest := httptest.NewRequest(http.MethodPost, "/v1/operator/orders/"+orderID+"/pickup-token", nil)
+	issueRequest.Header.Set("Authorization", "Bearer "+operatorToken)
+	issueResponse := httptest.NewRecorder()
+	handler.ServeHTTP(issueResponse, issueRequest)
+	var tokenBody map[string]string
+	if err := json.Unmarshal(issueResponse.Body.Bytes(), &tokenBody); err != nil {
+		t.Fatal(err)
+	}
+	if issueResponse.Code != http.StatusCreated || tokenBody["pickup_token"] == "" {
+		t.Fatalf("issue pickup token status=%d body=%s", issueResponse.Code, issueResponse.Body.String())
+	}
+	pickupPayload, _ := json.Marshal(map[string]string{"pickup_token": tokenBody["pickup_token"]})
+	pickupRequest := httptest.NewRequest(http.MethodPost, "/v1/operator/orders/"+orderID+"/pickup", bytes.NewReader(pickupPayload))
+	pickupRequest.Header.Set("Content-Type", "application/json")
+	pickupRequest.Header.Set("Authorization", "Bearer "+operatorToken)
+	pickupResponse := httptest.NewRecorder()
+	handler.ServeHTTP(pickupResponse, pickupRequest)
+	if pickupResponse.Code != http.StatusOK || !strings.Contains(pickupResponse.Body.String(), `"picked_up_at"`) {
+		t.Fatalf("pickup status=%d body=%s", pickupResponse.Code, pickupResponse.Body.String())
+	}
+	duplicatePickupRequest := httptest.NewRequest(http.MethodPost, "/v1/operator/orders/"+orderID+"/pickup", bytes.NewReader(pickupPayload))
+	duplicatePickupRequest.Header.Set("Content-Type", "application/json")
+	duplicatePickupRequest.Header.Set("Authorization", "Bearer "+operatorToken)
+	pickupResponse = httptest.NewRecorder()
+	handler.ServeHTTP(pickupResponse, duplicatePickupRequest)
+	if pickupResponse.Code != http.StatusConflict || !strings.Contains(pickupResponse.Body.String(), `"error_code":"PICKUP_ALREADY_DONE"`) {
+		t.Fatalf("duplicate pickup status=%d body=%s", pickupResponse.Code, pickupResponse.Body.String())
+	}
+}
+
+func TestOperatorRoutesRequireConfiguredBearerToken(t *testing.T) {
+	t.Setenv("DEMO_MODE", "true")
+	t.Setenv("DEMO_OPERATOR_TOKEN", "operator-secret-at-least-32-characters")
+	handler := (API{}).Handler()
+	for _, tc := range []struct {
+		authorization string
+		status        int
+	}{
+		{"", http.StatusUnauthorized},
+		{"Bearer wrong-token", http.StatusUnauthorized},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/v1/operator/orders", nil)
+		if tc.authorization != "" {
+			req.Header.Set("Authorization", tc.authorization)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != tc.status {
+			t.Errorf("authorization=%q status=%d want=%d body=%s", tc.authorization, rec.Code, tc.status, rec.Body.String())
+		}
+		if tc.status == http.StatusUnauthorized && !strings.Contains(rec.Body.String(), `"error_code":"OPERATOR_UNAUTHORIZED"`) {
+			t.Errorf("missing house auth error: %s", rec.Body.String())
+		}
+	}
+	t.Setenv("DEMO_OPERATOR_TOKEN", "short")
+	req := httptest.NewRequest(http.MethodGet, "/v1/operator/orders", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), `"error_code":"UNEXPECTED_ERROR"`) {
+		t.Fatalf("missing operator secret status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPreconditionErrorIncludesExtraAndCorrectStatus(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writePreconditionError(recorder, "ORDER_NOT_ELIGIBLE", map[string]any{"order_state": "expired"})
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	extra, ok := body["extra"].(map[string]any)
+	if recorder.Code != http.StatusPreconditionFailed || body["error_code"] != "ORDER_NOT_ELIGIBLE" || !ok || extra["order_state"] != "expired" {
+		t.Fatalf("status=%d body=%v", recorder.Code, body)
+	}
 }
 
 func TestHTTPErrorBuilderContract(t *testing.T) {
@@ -160,7 +263,9 @@ func TestHTTPErrorBuilderContract(t *testing.T) {
 		{http.StatusBadRequest, "MALFORMED_REQUEST", 400, "MALFORMED_REQUEST"},
 		{http.StatusUnprocessableEntity, "INVALID_PARAMS", 422, "INVALID_PARAMS"},
 		{http.StatusNotFound, "ORDER_NOT_FOUND", 404, "ORDER_NOT_FOUND"},
+		{http.StatusNotFound, "OFFER_NOT_FOUND", 404, "OFFER_NOT_FOUND"},
 		{http.StatusConflict, "IDEMPOTENCY_CONFLICT", 409, "IDEMPOTENCY_CONFLICT"},
+		{http.StatusConflict, "OFFER_UNAVAILABLE", 409, "OFFER_UNAVAILABLE"},
 		{http.StatusBadGateway, "DEPENDENCY_REQUEST", 502, "DEPENDENCY_REQUEST"},
 		{http.StatusRequestEntityTooLarge, "PAYLOAD_TOO_LARGE", 413, "PAYLOAD_TOO_LARGE"},
 		{http.StatusInternalServerError, "db details must not leak", 500, "UNEXPECTED_ERROR"},
@@ -192,6 +297,18 @@ func TestAPIOnlyRegistersVersionedRoutesAndDevRouteIsModeGated(t *testing.T) {
 		if recorder.Code != http.StatusNotFound {
 			t.Errorf("legacy/disabled route %s status=%d", path, recorder.Code)
 		}
+	}
+	for _, path := range []string{"/v1/operator/orders/order/pickup-token", "/v1/operator/orders/order/pickup"} {
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"pickup_token":"x"}`)))
+		if recorder.Code != http.StatusNotFound {
+			t.Errorf("operator route outside demo %s status=%d", path, recorder.Code)
+		}
+	}
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/operator/orders", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Errorf("operator list outside demo status=%d", recorder.Code)
 	}
 }
 

@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func integrationStore(t *testing.T) *Store {
@@ -183,6 +185,133 @@ func TestLatePaymentDoesNotIncrementStockAfterAnotherOrderTakesReleasedUnit(t *t
 	}
 	if units != 0 {
 		t.Fatalf("late payment made stock available while second order %s holds it: available=%d", second.ID, units)
+	}
+}
+
+func TestCreateOrderDistinguishesMissingOfferFromSoldOut(t *testing.T) {
+	s := integrationStore(t)
+	if _, err := s.CreateOrder(context.Background(), offerID(t)+"-sold-out", offerID(t)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateOrder(context.Background(), offerID(t)+"-unavailable", offerID(t)); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("sold out err=%v", err)
+	}
+	if _, err := s.CreateOrder(context.Background(), offerID(t)+"-missing", "missing-"+testID(t)); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("missing offer err=%v", err)
+	}
+}
+
+func TestMarkPaidRejectsAlreadyPaidOrderWithDomainError(t *testing.T) {
+	s := integrationStore(t)
+	order, err := s.CreateOrder(context.Background(), offerID(t)+"-terminal", offerID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MarkPaid(context.Background(), order.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MarkPaid(context.Background(), order.ID); !errors.Is(err, ErrOrderNotPayable) {
+		t.Fatalf("second mark-paid err=%v", err)
+	}
+}
+
+func TestPersistPaidEventReportsWhetherItCreatedTheEvent(t *testing.T) {
+	s := integrationStore(t)
+	order, err := s.CreateOrder(context.Background(), offerID(t)+"-event-created", offerID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventKey := "event-created-" + testID(t)
+	created, err := s.PersistPaidEvent(context.Background(), testID(t), order.ID, eventKey)
+	if err != nil || !created {
+		t.Fatalf("first event created=%t err=%v", created, err)
+	}
+	created, err = s.PersistPaidEvent(context.Background(), testID(t), order.ID, eventKey)
+	if err != nil || created {
+		t.Fatalf("duplicate event created=%t err=%v", created, err)
+	}
+}
+
+func TestPickupCredentialCanOnlyBeRedeemedOnceAndOnlyWhenPaid(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	order, err := s.CreateOrder(ctx, offerID(t)+"-pickup", offerID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.IssuePickupCredential(ctx, order.ID); !errors.Is(err, ErrPickupNotEligible) {
+		t.Fatalf("issue before payment err=%v", err)
+	}
+	if _, err := s.MarkPaid(ctx, order.ID); err != nil {
+		t.Fatal(err)
+	}
+	token, err := s.IssuePickupCredential(ctx, order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := s.IssuePickupCredential(ctx, order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RedeemPickupCredential(ctx, order.ID, token); !errors.Is(err, ErrPickupCredentialInvalid) {
+		t.Fatalf("superseded token err=%v", err)
+	}
+	picked, err := s.RedeemPickupCredential(ctx, order.ID, rotated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if picked.PickedUpAt == nil {
+		t.Fatal("pickup timestamp was not persisted")
+	}
+	if _, err := s.RedeemPickupCredential(ctx, order.ID, rotated); !errors.Is(err, ErrPickupAlreadyCompleted) {
+		t.Fatalf("second redemption err=%v", err)
+	}
+	if _, err := s.IssuePickupCredential(ctx, order.ID); !errors.Is(err, ErrPickupAlreadyCompleted) {
+		t.Fatalf("issue after pickup err=%v", err)
+	}
+}
+
+func TestConcurrentPickupRedemptionSucceedsExactlyOnce(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	order, err := s.CreateOrder(ctx, offerID(t)+"-pickup-race", offerID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MarkPaid(ctx, order.ID); err != nil {
+		t.Fatal(err)
+	}
+	token, err := s.IssuePickupCredential(ctx, order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	successes, alreadyDone := 0, 0
+	var unexpected []error
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := s.RedeemPickupCredential(ctx, order.ID, token)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				successes++
+			case errors.Is(err, ErrPickupAlreadyCompleted):
+				alreadyDone++
+			default:
+				unexpected = append(unexpected, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if len(unexpected) != 0 || successes != 1 || alreadyDone != 1 {
+		t.Fatalf("successes=%d already_done=%d unexpected=%v", successes, alreadyDone, unexpected)
 	}
 }
 
