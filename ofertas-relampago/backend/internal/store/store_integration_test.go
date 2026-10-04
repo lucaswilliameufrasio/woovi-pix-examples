@@ -410,3 +410,75 @@ func TestConcurrentWorkersClaimEachPaymentEventOnce(t *testing.T) {
 		t.Fatalf("completed=%d attempts_not_once=%d", completed, wrongAttempts)
 	}
 }
+
+func TestOneTransientEventFailureDoesNotBlockBatch(t *testing.T) {
+	s := integrationStore(t)
+	offer := offerID(t)
+	if _, err := s.pool.Exec(context.Background(), `UPDATE offers SET total_units=2,available_units=2 WHERE id=$1`, offer); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.CreateOrder(context.Background(), offer+"-batch-first", offer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.CreateOrder(context.Background(), offer+"-batch-second", offer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedEventID := testID(t)
+	secondEventID := testID(t)
+	if inserted, err := s.PersistPaidEvent(context.Background(), failedEventID, first.ID, "batch-first-"+testID(t)); err != nil || !inserted {
+		t.Fatalf("first event inserted=%v err=%v", inserted, err)
+	}
+	if inserted, err := s.PersistPaidEvent(context.Background(), secondEventID, second.ID, "batch-second-"+testID(t)); err != nil || !inserted {
+		t.Fatalf("second event inserted=%v err=%v", inserted, err)
+	}
+	if _, err := s.pool.Exec(context.Background(), `UPDATE payment_events SET received_at=CASE id WHEN $1 THEN now()-interval '2 seconds' ELSE now()-interval '1 second' END WHERE id IN ($1,$2)`, failedEventID, secondEventID); err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("temporary process failure")
+	processed, err := s.processPaymentEvents(context.Background(), 10, func(ctx context.Context, eventID, orderID string) error {
+		if eventID == failedEventID {
+			return injected
+		}
+		return s.processPaymentEvent(ctx, eventID, orderID)
+	})
+	if processed != 1 || !errors.Is(err, injected) {
+		t.Fatalf("processed=%d err=%v", processed, err)
+	}
+	firstState, err := s.GetOrder(context.Background(), first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondState, err := s.GetOrder(context.Background(), second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstState.State != "pending_payment" || secondState.State != "paid" {
+		t.Fatalf("first=%s second=%s", firstState.State, secondState.State)
+	}
+	var firstLease, secondDone bool
+	if err := s.pool.QueryRow(context.Background(), `SELECT lease_until>now() FROM payment_events WHERE id=$1`, failedEventID).Scan(&firstLease); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.pool.QueryRow(context.Background(), `SELECT processed_at IS NOT NULL FROM payment_events WHERE id=$1`, secondEventID).Scan(&secondDone); err != nil {
+		t.Fatal(err)
+	}
+	if !firstLease || !secondDone {
+		t.Fatalf("failed lease active=%v later event done=%v", firstLease, secondDone)
+	}
+	if _, err := s.pool.Exec(context.Background(), `UPDATE payment_events SET lease_until=now()-interval '1 second' WHERE id=$1`, failedEventID); err != nil {
+		t.Fatal(err)
+	}
+	processed, err = s.ProcessPaymentEvents(context.Background(), 10)
+	if processed != 1 || err != nil {
+		t.Fatalf("retry processed=%d err=%v", processed, err)
+	}
+	firstState, err = s.GetOrder(context.Background(), first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstState.State != "paid" {
+		t.Fatalf("retried first order state=%s", firstState.State)
+	}
+}

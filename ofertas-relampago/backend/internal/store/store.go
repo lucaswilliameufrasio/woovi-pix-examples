@@ -309,18 +309,21 @@ func (s *Store) processPaymentEvents(ctx context.Context, limit int, process fun
 		return 0, err
 	}
 	processed := 0
+	var processingErrors []error
 	for _, e := range events {
 		if err := process(ctx, e.id, e.orderID); err != nil {
 			backoff := retryBackoff(e.attempts)
 			_, releaseErr := s.pool.Exec(ctx, `UPDATE payment_events SET lease_until=now()+($2 * interval '1 second'),last_error='transient processing error' WHERE id=$1 AND processed_at IS NULL`, e.id, int64(backoff.Seconds()))
 			if releaseErr != nil {
-				return processed, fmt.Errorf("process payment event: %w; release lease: %v", err, releaseErr)
+				processingErrors = append(processingErrors, fmt.Errorf("process payment event: %w; release lease: %v", err, releaseErr))
+				continue
 			}
-			return processed, fmt.Errorf("process payment event: %w", err)
+			processingErrors = append(processingErrors, fmt.Errorf("process payment event: %w", err))
+			continue
 		}
 		processed++
 	}
-	return processed, nil
+	return processed, errors.Join(processingErrors...)
 }
 
 func retryBackoff(attempt int) time.Duration {
