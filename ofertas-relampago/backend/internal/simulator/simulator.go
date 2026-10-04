@@ -29,6 +29,7 @@ func New(st *store.Store, lookup func(string) (int64, error), deliver func(strin
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /charges", s.create)
+	mux.HandleFunc("POST /charges/{orderID}/retry", s.createForOrder)
 	mux.HandleFunc("POST /charges/{orderID}/pay", s.pay)
 	mux.HandleFunc("GET /charges/{orderID}", s.get)
 	mux.HandleFunc("POST /dev/webhooks/{orderID}/paid", s.pay)
@@ -45,12 +46,20 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request", 400)
 		return
 	}
-	amount, err := s.lookup(in.OrderID)
+	s.createCharge(w, r, in.OrderID)
+}
+
+func (s *Server) createForOrder(w http.ResponseWriter, r *http.Request) {
+	s.createCharge(w, r, r.PathValue("orderID"))
+}
+
+func (s *Server) createCharge(w http.ResponseWriter, r *http.Request, orderID string) {
+	amount, err := s.lookup(orderID)
 	if err != nil {
 		http.Error(w, "order not found", 404)
 		return
 	}
-	saved, err := s.store.CreateSimulatedCharge(r.Context(), in.OrderID, amount)
+	saved, err := s.store.CreateSimulatedCharge(r.Context(), orderID, amount)
 	if errors.Is(err, store.ErrChargeConflict) {
 		http.Error(w, "idempotency conflict", http.StatusConflict)
 		return
@@ -106,7 +115,21 @@ func (s *Server) scenario(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.PathValue("name") {
 	case "timeout":
-		http.Error(w, "simulated timeout after charge creation", http.StatusGatewayTimeout)
+		orderID := r.URL.Query().Get("order_id")
+		if orderID == "" {
+			http.Error(w, "order_id is required", http.StatusBadRequest)
+			return
+		}
+		amount, err := s.lookup(orderID)
+		if err != nil {
+			http.Error(w, "order not found", http.StatusNotFound)
+			return
+		}
+		if _, err := s.store.CreateSimulatedCharge(r.Context(), orderID, amount); err != nil {
+			http.Error(w, "charge persistence failed", http.StatusInternalServerError)
+			return
+		}
+		http.Error(w, "simulated timeout after charge creation; retry with the same order_id", http.StatusGatewayTimeout)
 	case "rate-limit":
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "simulated rate limit", http.StatusTooManyRequests)

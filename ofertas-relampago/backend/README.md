@@ -37,6 +37,8 @@ curl -s http://127.0.0.1:8080/operator/orders
 
 Simulator `/charges` deriva o valor do pedido pelo backend e persiste a cobrança no PostgreSQL; é idempotente por `order_id`, inclusive após reinício. `pay` atualiza o status e envia evento pago ao endpoint local; o backend persiste e deduplica o evento antes do HTTP 202 e um worker processa o evento. O worker reserva eventos com lease durável, recupera leases vencidos e agenda retry exponencial limitado para falhas transitórias. Há também um job periódico de expiração. Para exercitar webhook duplicado, repetir `POST /dev/webhooks/paid` com o mesmo `event_key`; reusar a chave em outro pedido conflita. `POST /dev/scenarios/duplicate-paid/ORDER_ID` simula reenvio do evento pago; `POST /dev/webhooks/ORDER_ID/late-paid` simula notificação tardia. Cenários `/dev` só funcionam com `DEMO_MODE=true`.
 
+Para simular timeout incerto após a cobrança ser criada, use `POST /dev/scenarios/timeout?order_id=ORDER_ID` (retorna 504, mas persiste a cobrança). Reconcilie consultando `GET /charges/ORDER_ID` ou repetindo `POST /charges/ORDER_ID/retry`; ambos retornam a mesma cobrança por referência idempotente. Esse fluxo é apenas do simulador local.
+
 ## Testes
 
 Com PostgreSQL real disponível:

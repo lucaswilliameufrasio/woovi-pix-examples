@@ -42,7 +42,7 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	offerID := "sim-" + hex.EncodeToString(suffix[:])
-	if _, err := pool.Exec(ctx, `INSERT INTO offers(id,title,price_cents,total_units,available_units,reservation_ttl_seconds) VALUES($1,'Simulator E2E',1999,1,1,60)`, offerID); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO offers(id,title,price_cents,total_units,available_units,reservation_ttl_seconds) VALUES($1,'Simulator E2E',1999,2,2,60)`, offerID); err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
@@ -92,6 +92,32 @@ func TestLocalPaymentSimulatorEndToEnd(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || charge.AmountCents != 1999 {
 		t.Fatalf("charge=%+v status=%d", charge, resp.StatusCode)
+	}
+	// The timeout scenario persists a charge but drops the response; retrying
+	// with the same order reference must recover the exact same charge.
+	other, err := st.CreateOrder(ctx, "timeout-"+offerID, offerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err = client.Post(sim.URL+"/dev/scenarios/timeout?order_id="+other.ID, "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("timeout scenario status=%d", resp.StatusCode)
+	}
+	resp, err = client.Post(sim.URL+"/charges/"+other.ID+"/retry", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var retried Charge
+	if err := json.NewDecoder(resp.Body).Decode(&retried); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || retried.ID != "sim-"+other.ID || retried.AmountCents != other.Amount {
+		t.Fatalf("retry charge=%+v status=%d", retried, resp.StatusCode)
 	}
 	sim.Close()
 	// A fresh simulator process reads the same durable charge from PostgreSQL.
