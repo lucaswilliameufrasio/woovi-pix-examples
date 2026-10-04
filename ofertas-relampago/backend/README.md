@@ -19,6 +19,7 @@ go run ./cmd/offers
 ```
 
 A API fica em `http://127.0.0.1:8080`; simulador em `http://127.0.0.1:8081`. Ajuste `API_ADDR`/`SIMULATOR_ADDR` se essas portas estiverem ocupadas. Use `:0` para obter portas efêmeras (os endereços escolhidos aparecem nos logs e o próprio processo configura o endereço interno da API para o simulador). A oferta seed `demo-offer` tem uma unidade. O modo demo habilita rotas `/dev`; não as habilite em deployments reais. API e simulador são independentes do restante do monorepo.
+A API e o simulador exigem `DEMO_MODE=true` e só aceitam bind em IP loopback (`127.0.0.1` ou `::1`); esta versão não suporta deployment nem chamadas PSP reais.
 
 ## Fluxo HTTP
 

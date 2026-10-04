@@ -32,14 +32,28 @@ func main() {
 		slog.Error("database migration failed", "error", err)
 		os.Exit(1)
 	}
+	if os.Getenv("DEMO_MODE") != "true" {
+		slog.Error("this backend currently supports the local simulator only; set DEMO_MODE=true for local use")
+		os.Exit(1)
+	}
 	apiServer := &http.Server{Handler: (httpapi.API{Store: st}).Handler(), ReadHeaderTimeout: 5 * time.Second}
 	simServer := &http.Server{Handler: simulatorHandler(st), ReadHeaderTimeout: 5 * time.Second}
-	apiListener, err := net.Listen("tcp", env("API_ADDR", "127.0.0.1:8080"))
+	apiAddr := env("API_ADDR", "127.0.0.1:8080")
+	if !loopbackAddress(apiAddr) {
+		slog.Error("API_ADDR must use a loopback IP literal")
+		os.Exit(1)
+	}
+	simAddr := env("SIMULATOR_ADDR", "127.0.0.1:8081")
+	if !loopbackAddress(simAddr) {
+		slog.Error("SIMULATOR_ADDR must use a loopback IP literal")
+		os.Exit(1)
+	}
+	apiListener, err := net.Listen("tcp", apiAddr)
 	if err != nil {
 		slog.Error("API listener failed", "error", err)
 		os.Exit(1)
 	}
-	simListener, err := net.Listen("tcp", env("SIMULATOR_ADDR", "127.0.0.1:8081"))
+	simListener, err := net.Listen("tcp", simAddr)
 	if err != nil {
 		_ = apiListener.Close()
 		slog.Error("simulator listener failed", "error", err)
@@ -143,4 +157,13 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func loopbackAddress(address string) bool {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

@@ -154,6 +154,38 @@ func TestLatePaymentWhenPendingReleasesReservedStockAtomically(t *testing.T) {
 	}
 }
 
+func TestLatePaymentDoesNotIncrementStockAfterAnotherOrderTakesReleasedUnit(t *testing.T) {
+	s := integrationStore(t)
+	first, err := s.CreateOrder(context.Background(), offerID(t)+"-first", offerID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(context.Background(), `UPDATE orders SET expires_at=now()-interval '1 second' WHERE id=$1`, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ExpireOrders(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.CreateOrder(context.Background(), offerID(t)+"-second", offerID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	late, err := s.MarkPaid(context.Background(), first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if late.State != "payment_exception" {
+		t.Fatalf("late order state=%s", late.State)
+	}
+	var units int
+	if err := s.pool.QueryRow(context.Background(), `SELECT available_units FROM offers WHERE id=$1`, offerID(t)).Scan(&units); err != nil {
+		t.Fatal(err)
+	}
+	if units != 0 {
+		t.Fatalf("late payment made stock available while second order %s holds it: available=%d", second.ID, units)
+	}
+}
+
 func TestExpirationAndPaidRaceDoesNotLoseUnit(t *testing.T) {
 	s := integrationStore(t)
 	order, err := s.CreateOrder(context.Background(), offerID(t)+"-payment", offerID(t))
