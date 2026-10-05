@@ -1,76 +1,48 @@
-import { error } from "@sveltejs/kit";
-import type { PageServerLoad } from "./$types";
-import type { ApiError, DemoOrder } from "../../../lib/types";
+import { error, fail } from "@sveltejs/kit";
+import { createHash } from "node:crypto";
+import type { Actions, PageServerLoad } from "./$types";
+import type { ApiError } from "../../../lib/types";
+import {
+  apiError,
+  backendRequest,
+  credential,
+  parseOrder,
+  record,
+} from "../../../lib/server/backend";
+import { orderCookie } from "../../../lib/server/order-access";
 
-function record(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function orderState(value: unknown): value is DemoOrder["state"] {
-  return (
-    value === "pending_payment" ||
-    value === "paid" ||
-    value === "expired" ||
-    value === "payment_exception"
-  );
-}
-
-function parseOrder(body: unknown, orderId: string): DemoOrder | undefined {
-  if (!record(body)) {
-    return undefined;
+function requireOrderId(orderId: string): void {
+  if (!/^[A-Za-z0-9_-]{1,200}$/.test(orderId)) {
+    error(404, "Pedido não encontrado.");
   }
-  if (
-    body.id !== orderId ||
-    typeof body.offer_id !== "string" ||
-    !body.offer_id.trim() ||
-    typeof body.amount_cents !== "number" ||
-    !Number.isSafeInteger(body.amount_cents) ||
-    body.amount_cents <= 0 ||
-    !orderState(body.state) ||
-    typeof body.expires_at !== "string" ||
-    !Number.isFinite(Date.parse(body.expires_at))
-  ) {
-    return undefined;
-  }
-  // Project only display fields; do not forward arbitrary backend fields.
-  return {
-    id: orderId,
-    offer_id: body.offer_id,
-    amount_cents: body.amount_cents,
-    state: body.state,
-    expires_at: body.expires_at,
-  };
 }
 
 export const load = (async ({
   params,
-  fetch,
-}: Pick<Parameters<PageServerLoad>[0], "params" | "fetch">) => {
-  const orderId = params.order_id;
-  if (!/^[A-Za-z0-9_-]{1,200}$/.test(orderId)) {
-    error(404, "Pedido não encontrado.");
+  cookies,
+}: Pick<Parameters<PageServerLoad>[0], "params"> & {
+  cookies: Pick<Parameters<PageServerLoad>[0]["cookies"], "get">;
+}) => {
+  requireOrderId(params.order_id);
+  const token = cookies.get(orderCookie(params.order_id));
+  if (!credential(token)) {
+    error(
+      401,
+      "Acesso ao pedido indisponível neste navegador ou expirado. O ID não autoriza consulta.",
+    );
   }
-  const baseUrl = process.env.API_BASE_URL || "http://127.0.0.1:8080";
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8000);
-  let response: Response;
-  let body: unknown;
+  let result: Awaited<ReturnType<typeof backendRequest>>;
   try {
-    response = await fetch(
-      `${baseUrl}/v1/orders/${encodeURIComponent(orderId)}`,
+    result = await backendRequest(
+      globalThis.fetch,
+      `/v1/customer/orders/${encodeURIComponent(params.order_id)}`,
       {
-        signal: controller.signal,
-        headers: { accept: "application/json" },
+        headers: {
+          accept: "application/json",
+          authorization: `Bearer ${token}`,
+        },
       },
     );
-    try {
-      body = await response.json();
-    } catch (failure) {
-      if (controller.signal.aborted) {
-        throw failure;
-      }
-      body = undefined;
-    }
   } catch {
     return {
       order: undefined,
@@ -80,13 +52,20 @@ export const load = (async ({
         error_code: "DEPENDENCY_REQUEST",
       } satisfies ApiError,
     };
-  } finally {
-    clearTimeout(timer);
   }
-  if (response.status === 404) {
+  if (result.response.status === 401) {
+    error(
+      401,
+      "A credencial do pedido expirou ou foi revogada. Não crie outro pedido para recuperar este acesso.",
+    );
+  }
+  if (result.response.status === 404) {
     error(404, "Pedido não encontrado.");
   }
-  const order = response.status === 200 ? parseOrder(body, orderId) : undefined;
+  const order =
+    result.response.status === 200
+      ? parseOrder(result.body, params.order_id)
+      : undefined;
   if (!order) {
     return {
       order: undefined,
@@ -98,3 +77,70 @@ export const load = (async ({
   }
   return { order, lookup_error: undefined };
 }) satisfies PageServerLoad;
+
+export const actions = {
+  checkout: async ({
+    params,
+    cookies,
+  }: Pick<Parameters<NonNullable<Actions[string]>>[0], "params"> & {
+    cookies: Pick<
+      Parameters<NonNullable<Actions[string]>>[0]["cookies"],
+      "get"
+    >;
+  }) => {
+    requireOrderId(params.order_id);
+    const token = cookies.get(orderCookie(params.order_id));
+    if (!credential(token)) {
+      return fail(401, {
+        message: "A credencial do pedido não está disponível neste navegador.",
+        error_code: "ORDER_UNAUTHORIZED",
+      });
+    }
+    try {
+      const { response, body } = await backendRequest(
+        globalThis.fetch,
+        `/v1/customer/orders/${encodeURIComponent(params.order_id)}/checkout`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "Idempotency-Key": `web-checkout-${createHash("sha256").update(params.order_id).digest("hex")}`,
+          },
+        },
+      );
+      if (!response.ok) {
+        return fail(
+          response.status,
+          apiError(body, "Não foi possível abrir a sessão local."),
+        );
+      }
+      if (
+        ![200, 201].includes(response.status) ||
+        !record(body) ||
+        body.order_id !== params.order_id ||
+        typeof body.checkout_id !== "string" ||
+        !/^[a-f0-9-]{36}$/.test(body.checkout_id) ||
+        body.mode !== "local_simulation" ||
+        !credential(body.access_token) ||
+        "pix_copy_paste" in body
+      ) {
+        return fail(502, {
+          message:
+            "Resposta de sessão inválida; ela pode ter sido criada. Use este mesmo botão para recuperar a mesma referência, sem outra reserva.",
+          error_code: "DEPENDENCY_INVALID_RESPONSE",
+        });
+      }
+      // No checkout credential goes into action data, cookies or SSR markup.
+      // The order capability is enough to recover this idempotent local resource.
+      return {
+        checkout: { checkout_id: body.checkout_id, mode: "local_simulation" },
+      };
+    } catch {
+      return fail(502, {
+        message:
+          "A API não respondeu; a sessão pode ter sido criada. Use este mesmo botão para recuperar a mesma referência, sem outra reserva.",
+        error_code: "DEPENDENCY_REQUEST",
+      });
+    }
+  },
+} satisfies Actions;

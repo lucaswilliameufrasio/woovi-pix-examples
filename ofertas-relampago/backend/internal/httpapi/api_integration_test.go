@@ -60,7 +60,7 @@ func TestOrderRoutesAgainstPostgres(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	var created store.Order
+	var created store.OrderAccess
 	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
 		t.Fatal(err)
 	}
@@ -80,6 +80,7 @@ func TestOrderRoutesAgainstPostgres(t *testing.T) {
 		t.Fatalf("persisted amount=%d", persisted)
 	}
 	req = httptest.NewRequest(http.MethodGet, "/v1/orders/"+orderID, nil)
+	req.Header.Set("Authorization", "Bearer "+created.AccessToken)
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {

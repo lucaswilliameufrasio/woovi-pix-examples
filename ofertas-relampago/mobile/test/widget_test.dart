@@ -9,15 +9,139 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:ofertas_relampago_app/main.dart';
 import 'package:ofertas_relampago_app/offers_api.dart';
 import 'package:woovi_pix_flutter/woovi_pix_flutter.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:ofertas_relampago_app/order_access.dart';
+
+void seedAccess(List<String> ids) {
+  FlutterSecureStorage.setMockInitialValues({
+    for (final id in ids)
+      SecureOrderAccessStore.key('http://127.0.0.1:8080', id): OrderAccess(
+        'a' * 64,
+        DateTime.now().toUtc().add(const Duration(minutes: 20)),
+      ).encode(),
+  });
+}
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  testWidgets('creation deadline has unknown outcome and never repeats POST', (
+    tester,
+  ) async {
+    var requests = 0;
+    final pending = Completer<http.Response>();
+    final api = OffersApi(
+      baseUrl: 'http://127.0.0.1:8080',
+      client: MockClient((r) {
+        requests++;
+        return pending.future;
+      }),
+    );
+    final assertion = expectLater(
+      api.createOrder('demo-offer'),
+      throwsA(isA<TimeoutException>()),
+    );
+    await tester.pump(const Duration(seconds: 8));
+    await assertion;
+    expect(requests, 1);
+    pending.complete(http.Response('{}', 201));
+    await tester.pump();
+  });
 
   test('local Woovi SDK package exports the merchant checkout contract', () {
     expect(CheckoutStatus.values, contains(CheckoutStatus.pending));
     expect(HttpCheckoutTransport, isA<Type>());
     expect(PixCheckoutView, isA<Type>());
   });
+
+  testWidgets('legacy history IDs cannot consult without secure capability', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({
+      'offers.order_history': ['legacy-order'],
+    });
+    seedAccess([]);
+    var orderRequests = 0;
+    final api = OffersApi(
+      baseUrl: 'http://127.0.0.1:8080',
+      client: MockClient((request) async {
+        if (request.url.path != '/v1/offers') orderRequests++;
+        return http.Response('[]', 200);
+      }),
+    );
+    await tester.pumpWidget(FlashOffersApp(api: api));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Meus pedidos'));
+    await tester.pumpAndSettle();
+    expect(orderRequests, 0);
+    expect(
+      find.textContaining('O histórico e o ID não autorizam consulta'),
+      findsOneWidget,
+    );
+    expect(find.text('Pedido legacy-order'), findsNothing);
+  });
+
+  testWidgets(
+    '401 removes stale confirmation and stops polling without public fallback',
+    (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      seedAccess([]);
+      var queries = 0;
+      final api = OffersApi(
+        baseUrl: 'http://127.0.0.1:8080',
+        client: MockClient((request) async {
+          if (request.url.path == '/v1/offers') {
+            return http.Response(
+              jsonEncode([
+                {
+                  'id': 'demo-offer',
+                  'title': 'Sacola teste',
+                  'price_cents': 2500,
+                  'available_units': 1,
+                  'reservation_ttl_seconds': 120,
+                },
+              ]),
+              200,
+            );
+          }
+          if (request.method == 'POST') {
+            return http.Response(
+              jsonEncode({
+                'id': 'order-revoked',
+                'amount_cents': 2500,
+                'state': 'pending_payment',
+                'order_access_token': 'a' * 64,
+                'order_token_expires_at': DateTime.now()
+                    .toUtc()
+                    .add(const Duration(minutes: 20))
+                    .toIso8601String(),
+              }),
+              201,
+            );
+          }
+          expect(request.url.path, '/v1/customer/orders/order-revoked');
+          queries++;
+          return http.Response(
+            '{"message":"Expirou","error_code":"ORDER_UNAUTHORIZED"}',
+            401,
+          );
+        }),
+      );
+      await tester.pumpWidget(FlashOffersApp(api: api));
+      await tester.pumpAndSettle();
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.tap(find.text('Reservar'));
+      await tester.pumpAndSettle();
+      expect(find.text('Sacola reservada'), findsOneWidget);
+      await tester.pump(const Duration(seconds: 5));
+      await tester.pumpAndSettle();
+      expect(queries, 1);
+      expect(find.text('Sacola reservada'), findsNothing);
+      expect(find.textContaining('expirou ou foi revogada'), findsOneWidget);
+      await tester.pump(const Duration(minutes: 1));
+      expect(queries, 1);
+    },
+  );
 
   testWidgets('restores saved order IDs and fetches their current state', (
     tester,
@@ -26,12 +150,14 @@ void main() {
       'offers.order_history': ['saved-order-1'],
     });
     var statusRequests = 0;
+    seedAccess(['saved-order-1']);
     var orderState = 'paid';
     final client = MockClient((request) async {
       if (request.url.path == '/v1/offers') {
         return http.Response('[]', 200);
       }
-      if (request.url.path == '/v1/orders/saved-order-1') {
+      if (request.url.path == '/v1/customer/orders/saved-order-1') {
+        expect(request.headers['authorization'], 'Bearer ${'a' * 64}');
         statusRequests++;
         return http.Response(
           jsonEncode({
@@ -49,7 +175,7 @@ void main() {
 
     await tester.pumpWidget(
       FlashOffersApp(
-        api: OffersApi(baseUrl: 'http://local.test', client: client),
+        api: OffersApi(baseUrl: 'http://127.0.0.1:8080', client: client),
       ),
     );
     await tester.pumpAndSettle();
@@ -75,9 +201,10 @@ void main() {
         'offers.order_history': ['offline-order'],
       });
       var online = false;
+      seedAccess(['offline-order']);
       final client = MockClient((request) async {
         if (request.url.path == '/v1/offers') return http.Response('[]', 200);
-        if (request.url.path == '/v1/orders/offline-order') {
+        if (request.url.path == '/v1/customer/orders/offline-order') {
           if (!online) throw http.ClientException('offline');
           return http.Response(
             jsonEncode({
@@ -93,7 +220,7 @@ void main() {
 
       await tester.pumpWidget(
         FlashOffersApp(
-          api: OffersApi(baseUrl: 'http://local.test', client: client),
+          api: OffersApi(baseUrl: 'http://127.0.0.1:8080', client: client),
         ),
       );
       await tester.pumpAndSettle();
@@ -128,6 +255,7 @@ void main() {
       'offers.order_history': ['slow-order'],
     });
     var statusRequests = 0;
+    seedAccess(['slow-order']);
     final pendingResponse = Completer<http.Response>();
     http.Response orderResponse() => http.Response(
       jsonEncode({
@@ -145,7 +273,7 @@ void main() {
     });
     await tester.pumpWidget(
       FlashOffersApp(
-        api: OffersApi(baseUrl: 'http://local.test', client: client),
+        api: OffersApi(baseUrl: 'http://127.0.0.1:8080', client: client),
       ),
     );
     await tester.pumpAndSettle();
@@ -177,6 +305,7 @@ void main() {
     tester,
   ) async {
     SharedPreferences.setMockInitialValues({});
+    seedAccess([]);
     var offerRequests = 0;
     var orderStatusRequests = 0;
     var orderCreated = false;
@@ -204,6 +333,11 @@ void main() {
         return http.Response(
           jsonEncode({
             'id': 'order-demo-123',
+            'order_access_token': 'a' * 64,
+            'order_token_expires_at': DateTime.now()
+                .toUtc()
+                .add(const Duration(minutes: 20))
+                .toIso8601String(),
             'offer_id': 'demo-offer',
             'amount_cents': 2500,
             'state': 'pending_payment',
@@ -214,7 +348,7 @@ void main() {
         );
       }
       if (request.method == 'GET' &&
-          request.url.path == '/v1/orders/order-demo-123') {
+          request.url.path == '/v1/customer/orders/order-demo-123') {
         orderStatusRequests++;
         return http.Response(
           jsonEncode({
@@ -230,7 +364,7 @@ void main() {
       }
       return http.Response('{}', 404);
     });
-    final api = OffersApi(baseUrl: 'http://local.test', client: client);
+    final api = OffersApi(baseUrl: 'http://127.0.0.1:8080', client: client);
 
     await tester.pumpWidget(FlashOffersApp(api: api));
     await tester.pumpAndSettle();

@@ -16,10 +16,33 @@ void main() {
   runApp(const FlashOffersApp());
 }
 
-class FlashOffersApp extends StatelessWidget {
+class FlashOffersApp extends StatefulWidget {
   const FlashOffersApp({super.key, this.api});
 
   final OffersApi? api;
+
+  @override
+  State<FlashOffersApp> createState() => _FlashOffersAppState();
+}
+
+class _FlashOffersAppState extends State<FlashOffersApp> {
+  late final bool _ownsApi;
+  late final OffersApi _api;
+
+  @override
+  void initState() {
+    super.initState();
+    _ownsApi = widget.api == null;
+    _api = widget.api ?? OffersApi.fromEnvironment();
+  }
+
+  @override
+  void dispose() {
+    if (_ownsApi) {
+      _api.close();
+    }
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -36,7 +59,7 @@ class FlashOffersApp extends StatelessWidget {
         ),
         fontFamily: 'Roboto',
       ),
-      home: OffersHome(api: api ?? OffersApi.fromEnvironment()),
+      home: OffersHome(api: _api),
     );
   }
 }
@@ -59,6 +82,8 @@ class _OffersHomeState extends State<OffersHome> with WidgetsBindingObserver {
   bool _loadingHistory = false;
   List<DemoOrder> _orderHistory = const [];
   bool _historyRefreshFailed = false;
+  bool _historyAccessMissing = false;
+  bool _orderAccessUnavailable = false;
   DemoOrder? _order;
   String? _error;
   String? _orderError;
@@ -91,7 +116,8 @@ class _OffersHomeState extends State<OffersHome> with WidgetsBindingObserver {
 
   void _scheduleOrderPoll() {
     _orderPollTimer?.cancel();
-    if (_order?.state != 'pending_payment' ||
+    if (_orderAccessUnavailable ||
+        _order?.state != 'pending_payment' ||
         WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
       return;
     }
@@ -120,6 +146,8 @@ class _OffersHomeState extends State<OffersHome> with WidgetsBindingObserver {
       if (!mounted) return;
       setState(() {
         _order = order;
+        _orderAccessUnavailable = false;
+        _orderError = widget.api.accessWasPersisted(order.id) ? null : 'Reserva criada, mas o acesso seguro não foi salvo. Ele será perdido ao reiniciar; não reserve novamente para recuperar acesso.';
         _orderHistory = [
           order,
           ..._orderHistory.where((item) => item.id != order.id),
@@ -129,6 +157,11 @@ class _OffersHomeState extends State<OffersHome> with WidgetsBindingObserver {
         await _saveOrderId(order.id);
       } catch (_) {
         // A storage error must not turn a successfully created order into UI failure.
+        if (mounted) {
+          setState(
+            () => _orderError = 'Reserva criada, mas o histórico não foi salvo. Guarde o ID para atendimento; ele não autoriza acesso.',
+          );
+        }
       }
       _pollInterval = const Duration(seconds: 5);
       _scheduleOrderPoll();
@@ -139,7 +172,9 @@ class _OffersHomeState extends State<OffersHome> with WidgetsBindingObserver {
       await _refresh(clearError: false);
     } catch (_) {
       if (!mounted) return;
-      setState(() => _error = 'Não foi possível conectar à loja local.');
+      setState(
+        () => _error = 'A reserva pode ter sido criada, mas não foi possível obter seu acesso. Não repita às cegas; procure o operador local.',
+      );
     } finally {
       if (mounted) setState(() => _creatingOrder = false);
     }
@@ -147,7 +182,9 @@ class _OffersHomeState extends State<OffersHome> with WidgetsBindingObserver {
 
   Future<void> _refreshOrder() async {
     final currentOrder = _order;
-    if (currentOrder == null || _refreshingOrder) return;
+    if (currentOrder == null || _refreshingOrder || _orderAccessUnavailable) {
+      return;
+    }
     setState(() {
       _refreshingOrder = true;
       _orderError = null;
@@ -170,7 +207,17 @@ class _OffersHomeState extends State<OffersHome> with WidgetsBindingObserver {
       }
     } on OffersApiException catch (error) {
       if (mounted) {
-        setState(() => _orderError = error.message);
+        setState(() {
+          _orderError = error.message;
+          if (error.errorCode == 'ORDER_UNAUTHORIZED') {
+            _error = error.message;
+            _orderAccessUnavailable = true;
+            _order = null;
+            _orderHistory = _orderHistory
+                .where((item) => item.id != currentOrder.id)
+                .toList();
+          }
+        });
         _increasePollInterval();
       }
     } catch (_) {
@@ -192,15 +239,23 @@ class _OffersHomeState extends State<OffersHome> with WidgetsBindingObserver {
   }
 
   Future<void> _loadOrderHistory() async {
+    if (_loadingHistory) return;
     setState(() => _loadingHistory = true);
     try {
       final preferences = await SharedPreferences.getInstance();
       final ids = preferences.getStringList('offers.order_history') ?? const [];
       final orders = <DemoOrder>[];
       var failedRequests = 0;
+      var missingAccess = false;
       for (final id in ids.take(20)) {
         try {
           orders.add(await widget.api.getOrder(id));
+        } on OffersApiException catch (error) {
+          if (error.errorCode == 'ORDER_UNAUTHORIZED') {
+            missingAccess = true;
+          } else {
+            failedRequests++;
+          }
         } catch (_) {
           failedRequests++;
           // Keep unreachable orders out of the displayed history; IDs remain
@@ -211,6 +266,7 @@ class _OffersHomeState extends State<OffersHome> with WidgetsBindingObserver {
         setState(() {
           _orderHistory = orders;
           _historyRefreshFailed = failedRequests > 0;
+          _historyAccessMissing = missingAccess;
         });
       }
     } catch (_) {
@@ -224,10 +280,13 @@ class _OffersHomeState extends State<OffersHome> with WidgetsBindingObserver {
   Future<void> _saveOrderId(String orderId) async {
     final preferences = await SharedPreferences.getInstance();
     final ids = preferences.getStringList('offers.order_history') ?? const [];
-    await preferences.setStringList(
+    final saved = await preferences.setStringList(
       'offers.order_history',
       [orderId, ...ids.where((id) => id != orderId)].take(20).toList(),
     );
+    if (!saved) {
+      throw StateError('Histórico não persistido.');
+    }
   }
 
   Future<void> _showOrderHistory() async {
@@ -272,6 +331,10 @@ class _OffersHomeState extends State<OffersHome> with WidgetsBindingObserver {
                   ],
                 ),
                 const SizedBox(height: 8),
+                if (_historyAccessMissing)
+                  const Text(
+                    'Há pedidos sem acesso seguro ou com acesso expirado. O histórico e o ID não autorizam consulta. Procure o operador; não repita a reserva.',
+                  ),
                 if (_loadingHistory)
                   const Center(child: CircularProgressIndicator())
                 else if (_orderHistory.isEmpty && _historyRefreshFailed)
@@ -710,6 +773,10 @@ class _OffersHomeState extends State<OffersHome> with WidgetsBindingObserver {
                   ),
                 ),
               ],
+              if (!widget.api.accessWasPersisted(order.id))
+                const Text(
+                  'Acesso disponível somente nesta execução: armazenamento seguro falhou. Não repita a reserva para recuperar acesso.',
+                ),
               const SizedBox(height: 4),
               TextButton.icon(
                 onPressed: _refreshingOrder ? null : _refreshOrder,

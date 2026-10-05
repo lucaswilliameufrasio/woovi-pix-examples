@@ -40,6 +40,10 @@ var errorMessages = map[string]string{
 	"PICKUP_TOKEN_INVALID":  "O código de retirada é inválido.",
 	"IDEMPOTENCY_CONFLICT":  "A chave de idempotência já foi usada com outros dados.",
 	"NOT_FOUND":             "Recurso não encontrado.",
+	"CHECKOUT_UNAUTHORIZED": "A credencial do checkout é inválida ou expirou.",
+	"CHECKOUT_NOT_ELIGIBLE": "O pedido não permite iniciar um checkout.",
+	"PAYMENT_EXCEPTION":     "O pagamento requer análise manual; não autoriza retirada.",
+	"ORDER_UNAUTHORIZED":    "A credencial do pedido é inválida ou expirou.",
 }
 
 func (a API) Handler() http.Handler {
@@ -56,13 +60,20 @@ func (a API) Handler() http.Handler {
 		writeJSON(w, http.StatusOK, offers)
 	})
 	mux.HandleFunc("POST /v1/orders", a.createOrder)
-	mux.HandleFunc("GET /v1/orders/{order_id}", a.getOrder)
+	mux.Handle("GET /v1/operator/orders/{order_id}", privateCheckout(a.operatorOnly(a.getOrder)))
 	mux.Handle("GET /v1/operator/orders", a.operatorOnly(a.listOrders))
 	mux.Handle("POST /v1/operator/orders/{order_id}/paid", a.operatorOnly(a.markOrderPaid))
 	mux.Handle("POST /v1/operator/orders/{order_id}/pickup-token", a.operatorOnly(a.issuePickupToken))
 	mux.Handle("POST /v1/operator/orders/{order_id}/pickup", a.operatorOnly(a.redeemPickup))
+	mux.Handle("POST /v1/operator/orders/{order_id}/checkout", privateCheckout(a.operatorOnly(a.issueLocalCheckout)))
 	mux.Handle("POST /v1/operator/demo/reset", a.operatorOnly(a.resetDemo))
 	if os.Getenv("DEMO_MODE") == "true" {
+		// Compatibility path, not a public lookup: the same order capability
+		// and expiry checks apply as on the explicit customer route.
+		mux.Handle("GET /v1/orders/{order_id}", privateCheckout(http.HandlerFunc(a.getCustomerOrder)))
+		mux.Handle("GET /v1/customer/orders/{order_id}", privateCheckout(http.HandlerFunc(a.getCustomerOrder)))
+		mux.Handle("POST /v1/customer/orders/{order_id}/checkout", privateCheckout(http.HandlerFunc(a.issueCustomerCheckout)))
+		mux.Handle("GET /v1/checkout-sessions/{checkout_id}", privateCheckout(http.HandlerFunc(a.getLocalCheckout)))
 		mux.HandleFunc("POST /v1/dev/webhooks/paid", a.paidWebhook)
 	}
 	return mux
@@ -90,6 +101,7 @@ func (a API) operatorOnly(next http.HandlerFunc) http.Handler {
 }
 
 func (a API) createOrder(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	var input struct {
 		OfferID string `json:"offer_id"`
 	}
@@ -121,7 +133,7 @@ func (a API) createOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "UNEXPECTED_ERROR")
 		return
 	}
-	order, err := a.Store.CreateOrder(r.Context(), id, input.OfferID)
+	order, err := a.Store.CreateOrderWithAccess(r.Context(), id, input.OfferID)
 	if errors.Is(err, store.ErrUnavailable) {
 		writeError(w, http.StatusPreconditionFailed, "OFFER_UNAVAILABLE")
 		return

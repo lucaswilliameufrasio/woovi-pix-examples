@@ -113,6 +113,14 @@ func (s *Store) Migrate(ctx context.Context) error {
 		_ = tx.Rollback(ctx)
 		return fmt.Errorf("migrate simulated charges: %w", err)
 	}
+	if _, err := tx.Exec(ctx, localCheckoutSchema); err != nil {
+		_ = tx.Rollback(ctx)
+		return fmt.Errorf("migrate local checkout: %w", err)
+	}
+	if _, err := tx.Exec(ctx, orderAccessSchema); err != nil {
+		_ = tx.Rollback(ctx)
+		return fmt.Errorf("migrate order access: %w", err)
+	}
 	_, err = tx.Exec(ctx, `INSERT INTO offers(id,title,price_cents,total_units,available_units,reservation_ttl_seconds)
 		VALUES ('demo-offer','Sacola surpresa — demonstração local',2500,1,1,120) ON CONFLICT(id) DO NOTHING`)
 	if err != nil {
@@ -148,6 +156,17 @@ func (s *Store) CreateOrder(ctx context.Context, id, offerID string) (Order, err
 		return Order{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	order, err := reserveOrder(ctx, tx, id, offerID)
+	if err != nil {
+		return Order{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Order{}, err
+	}
+	return order, nil
+}
+
+func reserveOrder(ctx context.Context, tx pgx.Tx, id, offerID string) (Order, error) {
 	var price int64
 	var ttl int
 	var offerExists bool
@@ -157,7 +176,7 @@ func (s *Store) CreateOrder(ctx context.Context, id, offerID string) (Order, err
 	if !offerExists {
 		return Order{}, pgx.ErrNoRows
 	}
-	err = tx.QueryRow(ctx, `UPDATE offers SET available_units=available_units-1 WHERE id=$1 AND available_units > 0 RETURNING price_cents,reservation_ttl_seconds`, offerID).Scan(&price, &ttl)
+	err := tx.QueryRow(ctx, `UPDATE offers SET available_units=available_units-1 WHERE id=$1 AND available_units > 0 RETURNING price_cents,reservation_ttl_seconds`, offerID).Scan(&price, &ttl)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Order{}, ErrUnavailable
 	}
@@ -167,9 +186,6 @@ func (s *Store) CreateOrder(ctx context.Context, id, offerID string) (Order, err
 	var order Order
 	err = tx.QueryRow(ctx, `INSERT INTO orders(id,offer_id,amount_cents,state,expires_at) VALUES($1,$2,$3,'pending_payment',now()+($4 * interval '1 second')) RETURNING id,offer_id,amount_cents,state,expires_at`, id, offerID, price, ttl).Scan(&order.ID, &order.OfferID, &order.Amount, &order.State, &order.ExpiresAt)
 	if err != nil {
-		return Order{}, err
-	}
-	if err := tx.Commit(ctx); err != nil {
 		return Order{}, err
 	}
 	return order, nil

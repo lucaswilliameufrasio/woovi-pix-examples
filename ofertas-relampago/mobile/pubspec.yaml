@@ -38,6 +38,7 @@ dependencies:
   woovi_pix_flutter:
     path: ../../../woovi-pix-flutter-sdk/packages/woovi_pix_flutter
   shared_preferences: ^2.5.5
+  flutter_secure_storage: 11.2.0
 
 dev_dependencies:
   flutter_test:

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { resolve } from "$app/paths";
   import type { PageProps } from "./$types";
-  let { data, params }: PageProps = $props();
+  let { data, params, form }: PageProps = $props();
   const money = (cents: number) =>
     new Intl.NumberFormat("pt-BR", {
       style: "currency",
@@ -56,6 +56,19 @@
         <dd>{expiry(order.expires_at)}</dd>
       </dl>
     </section>
+  {/if}
+  {#if data.order?.state === "pending_payment"}
+    <form method="POST" action="?/checkout">
+      <button type="submit">Abrir sessão local sem Pix</button>
+    </form>
+  {/if}
+  {#if form?.checkout}
+    <p role="status">
+      Sessão local {form.checkout.checkout_id}. Sem QR, código Pix ou pagamento
+      real.
+    </p>
+  {:else if form && "message" in form}
+    <p role="alert">{form.message}</p>
   {/if}
   <a
     class="refresh"
@@ -120,11 +133,13 @@
   a {
     color: #183a2b;
   }
-  a:focus-visible {
+  a:focus-visible,
+  button:focus-visible {
     outline: 3px solid #c27d54;
     outline-offset: 4px;
   }
-  .refresh {
+  .refresh,
+  button {
     display: inline-block;
     padding: 14px 18px;
     margin-top: 22px;

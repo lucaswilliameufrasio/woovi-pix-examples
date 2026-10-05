@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { actions, load } from "../../src/routes/+page.server";
+import type { Cookies } from "@sveltejs/kit";
 
 const pageLoad = load;
 const reserve = actions.reserve;
@@ -19,8 +20,11 @@ const response = (body: unknown, status = 200) =>
   });
 
 function event(fetchImpl: typeof fetch, formData?: FormData) {
+  vi.stubGlobal("fetch", fetchImpl);
   return {
     fetch: fetchImpl,
+    cookies: { set: vi.fn<Cookies["set"]>() },
+    url: new URL("http://127.0.0.1:5173/"),
     request: new Request("http://demo.test/", {
       method: "POST",
       body: formData,
@@ -31,6 +35,7 @@ function event(fetchImpl: typeof fetch, formData?: FormData) {
 describe("offers page server routes", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
     vi.useRealTimers();
   });
 
@@ -82,15 +87,37 @@ describe("offers page server routes", () => {
       state: "pending_payment",
       expires_at: "2026-10-04T21:00:00Z",
     };
-    const fetchMock = vi
-      .fn<typeof fetch>()
-      .mockResolvedValue(response(order, 201));
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      response(
+        {
+          ...order,
+          order_access_token: "a".repeat(64),
+          order_token_expires_at: new Date(
+            Date.now() + 20 * 60 * 1000,
+          ).toISOString(),
+          extra_secret: "never forward",
+        },
+        201,
+      ),
+    );
     const formData = new FormData();
     formData.set("offer_id", offer.id);
 
-    const result = await reserve(event(fetchMock, formData));
+    const input = event(fetchMock, formData);
+    const result = await reserve(input);
 
     expect(result).toEqual({ order });
+    expect(input.cookies.set).toHaveBeenCalledWith(
+      "order_access_order-a",
+      "a".repeat(64),
+      expect.objectContaining({
+        path: "/orders/order-a",
+        httpOnly: true,
+        sameSite: "strict",
+        secure: false,
+        expires: expect.any(Date),
+      }),
+    );
     expect(fetchMock).toHaveBeenCalledWith(
       "http://127.0.0.1:8080/v1/orders",
       expect.objectContaining({
@@ -227,4 +254,43 @@ describe("offers page server routes", () => {
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it.each([
+    {},
+    { order_access_token: "invalid" },
+    { order_access_token: "a".repeat(64), order_token_expires_at: "invalid" },
+    {
+      order_access_token: "a".repeat(64),
+      order_token_expires_at: new Date(Date.now() - 1000).toISOString(),
+    },
+  ])(
+    "Should not confirm a reservation without a valid private capability: %j",
+    async (access) => {
+      const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+        response(
+          {
+            id: "order-a",
+            offer_id: offer.id,
+            amount_cents: offer.price_cents,
+            state: "pending_payment",
+            expires_at: "2026-10-04T21:00:00Z",
+            ...access,
+          },
+          201,
+        ),
+      );
+      const form = new FormData();
+      form.set("offer_id", offer.id);
+      const input = event(fetchMock, form);
+      expect(await reserve(input)).toMatchObject({
+        status: 502,
+        data: {
+          error_code: "DEPENDENCY_INVALID_RESPONSE",
+          message: expect.stringContaining("pode ter sido criado"),
+        },
+      });
+      expect(input.cookies.set).not.toHaveBeenCalled();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    },
+  );
 });
