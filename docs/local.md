@@ -147,6 +147,17 @@ python3 tooling/run_offers_smoke.py --mobile
 
 Dois schemas exclusivos, cliente Flutter com HTTP/DB reais, reserva/consulta privada/restart e SQL; armazenamento seguro da plataforma substituído. Não é execução de UI/dispositivo nem teste nativo de Keystore/Keychain. `--web` e `--mobile` são modos separados. O mobile agora exige capability criada no mesmo app/origem: ID/histórico antigo não autoriza consulta; perda/expiração de acesso requer operador, não reserva repetida.
 
+Para executar a interface com Chromium headless real, instale o browser fixado uma vez e use o modo separado:
+
+```sh
+# Dentro de ofertas-relampago/web:
+mise exec -- npx --no-install playwright install chromium
+# Depois, na raiz:
+python3 tooling/run_offers_smoke.py --browser
+```
+
+São duas execuções UI/BFF/backend/DB/simulador com reserva, cookie privado, sessão/replay, confirmação local/worker e retirada única; acesso apenas por link é negado em outro contexto. Sem traces/cookies em arquivo, segredo do operador na página ou chamadas PSP. Não equivale à matriz completa de E2E nem valida dispositivo mobile/Safari/iOS. Todos os modos são mutuamente exclusivos e usam schemas próprios sem apagar pedidos existentes.
+
 O runner compila o backend com mise, cria **schema exclusivo** de teste no PostgreSQL local, gera token em memória e inicia API/simulador em portas efêmeras. Não toca pedidos de outros schemas. Executa o smoke duas vezes em schemas separados e encerra seus próprios processos. Mantém os schemas de teste para inspeção; não reseta nem apaga dados. Isso funciona mesmo com a seed do banco principal já consumida.
 
 Se seu PostgreSQL da demo usa outro projeto Compose/porta, informe `SMOKE_COMPOSE_PROJECT` e `SMOKE_DATABASE_PORT`. O runner usa somente `127.0.0.1` e as credenciais didáticas documentadas; não aceita URL de banco remoto.

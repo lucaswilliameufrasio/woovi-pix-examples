@@ -21,3 +21,7 @@ Thumbs.db
 # Vite
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Browser test artifacts (never publish cookies/traces)
+/test-results
+/playwright-report

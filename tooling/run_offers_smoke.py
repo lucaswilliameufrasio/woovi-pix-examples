@@ -42,7 +42,7 @@ def checked(command, cwd=BACKEND):
     return result.stdout.decode().strip()
 
 
-def run_web_smoke(api_addr, simulator_addr, logs):
+def run_web_smoke(api_addr, simulator_addr, logs, browser=False):
     log_path = logs / "web.log"
     env = {
         "PATH": os.environ["PATH"],
@@ -89,7 +89,46 @@ def run_web_smoke(api_addr, simulator_addr, logs):
                 time.sleep(0.1)
             if base is None:
                 raise SmokeFailure("Startup web não forneceu endereço local no prazo.")
-            web_smoke(base, "http://" + api_addr, "http://" + simulator_addr)
+            if browser:
+                browser_env = {
+                    "PATH": os.environ["PATH"],
+                    "HOME": os.environ["HOME"],
+                    "BROWSER_SMOKE_WEB_BASE": base,
+                    "BROWSER_SMOKE_API_BASE": "http://" + api_addr,
+                    "BROWSER_SMOKE_SIM_BASE": "http://" + simulator_addr,
+                    "BROWSER_SMOKE_OUTPUT_DIR": str(logs / "browser-results"),
+                    "DEMO_OPERATOR_TOKEN": os.environ["DEMO_OPERATOR_TOKEN"],
+                }
+                browser_process = subprocess.Popen(
+                    ["mise", "exec", "--", "npm", "run", "test:browser"],
+                    cwd=ROOT / "ofertas-relampago/web",
+                    env=browser_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+                try:
+                    browser_process.communicate(timeout=120)
+                except subprocess.TimeoutExpired as failure:
+                    # Stop only this harness's npm/Node/Chromium process group.
+                    os.killpg(browser_process.pid, signal.SIGTERM)
+                    try:
+                        browser_process.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(browser_process.pid, signal.SIGKILL)
+                        browser_process.communicate()
+                    raise SmokeFailure(
+                        "E2E Chromium excedeu o prazo; grupo de processos encerrado, output omitido."
+                    ) from failure
+                if browser_process.returncode:
+                    raise SmokeFailure(
+                        "E2E Chromium falhou; verifique instalação do browser/dependências. Output omitido para proteger cookies."
+                    )
+                print(
+                    "PASS Chromium E2E: reserva UI, cookie privado, acesso cruzado negado, restart, sessão/replay e pagamento/worker/retirada local."
+                )
+            else:
+                web_smoke(base, "http://" + api_addr, "http://" + simulator_addr)
         finally:
             # The group belongs only to this runner's npm/Vite subprocesses.
             try:
@@ -102,7 +141,7 @@ def run_web_smoke(api_addr, simulator_addr, logs):
                 pass
 
 
-def one_run(binary, logs, web=False, mobile=False):
+def one_run(binary, logs, web=False, mobile=False, browser=False):
     schema = "smoke_" + uuid.uuid4().hex
     checked(
         [
@@ -177,8 +216,8 @@ def one_run(binary, logs, web=False, mobile=False):
                     raise SmokeFailure(
                         "Teste Flutter/HTTP real falhou; saída omitida para não expor credenciais."
                     )
-            elif web:
-                run_web_smoke(api_addr, simulator_addr, logs)
+            elif web or browser:
+                run_web_smoke(api_addr, simulator_addr, logs, browser=browser)
             else:
                 offers_smoke("http://" + api_addr, "http://" + simulator_addr)
             sql = (
@@ -274,6 +313,11 @@ def main():
         action="store_true",
         help="Cliente Flutter real contra backend/PostgreSQL isolados; keystore substituído, sem dispositivo.",
     )
+    modes.add_argument(
+        "--browser",
+        action="store_true",
+        help="E2E Chromium UI real contra BFF/Go/PostgreSQL/simulador isolados, sem PSP.",
+    )
     args = parser.parse_args()
     try:
         temp_root = Path("/tmp/opencode") if Path("/tmp/opencode").is_dir() else None
@@ -286,7 +330,13 @@ def main():
                 ["mise", "exec", "--", "go", "build", "-o", str(binary), "./cmd/offers"]
             )
             for _ in range(2):
-                one_run(binary, workspace, web=args.web, mobile=args.mobile)
+                one_run(
+                    binary,
+                    workspace,
+                    web=args.web,
+                    mobile=args.mobile,
+                    browser=args.browser,
+                )
         print(
             "PASS isolated smoke: duas execuções completas, sem reset ou chamada PSP."
         )

@@ -38,6 +38,24 @@ O Prettier inclui arquivos `.svelte` com plugin fixado. Os testes Vitest verific
 
 Da raiz, com PostgreSQL healthy e dependências web instaladas, `python3 tooling/run_offers_smoke.py --web` sobe backend e BFF reais em portas efêmeras, valida cookie privado/HTML sem credenciais e percorre reserva → sessão → webhook/worker → consulta → retirada. Usa schemas exclusivos e mantém dados para inspeção. É teste HTTP/SSR, **não** execução de browser JavaScript/dispositivo.
 
+## E2E Chromium local
+
+Instale o browser da versão fixada de Playwright pelo Node/mise:
+
+```sh
+mise exec -- npx --no-install playwright install chromium
+```
+
+Na raiz, com PostgreSQL healthy:
+
+```sh
+python3 tooling/run_offers_smoke.py --browser
+```
+
+O runner executa duas vezes um teste de UI real com Chromium headless/BFF/Go/PostgreSQL/simulador, em schemas exclusivos e portas efêmeras: reserva, cookie HttpOnly/SameSite/prazo, ausência de token no HTML/JS, link sem acesso em outro contexto, recuperação por cookie em memória, sessão/replay, pagamento local/worker/status e retirada única. SQL valida uma cobrança/sessão/evento, sem reset. Segredo operacional fica somente no harness Node, não no processo web/Chromium nem na página. Rede HTTP remota é bloqueada nos contextos de teste. Sem retries, traces, screenshots, vídeos, HAR ou storageState em arquivo; resultados temporários ficam em `/tmp/opencode` e são removidos ao final.
+
+`npm run test:browser` exige a fixture do runner, não usa API remota nem reserva em banco compartilhado implicitamente. Este é apenas o primeiro caminho E2E local, não valida a matriz completa de timeout/expiração/conflitos/restart de backend, outros browsers, Pix/SDK, mobile nativo ou sandbox. No host atual, Playwright usa build fallback Ubuntu 24.04 de Chromium; resultado não comprova suporte nativo dessa distribuição.
+
 As convenções obrigatórias estão em `../../.agents/skills/typescript-code-standards/SKILL.md`. O ESLint rejeita `null` como estado de aplicação, casts, non-null assertions, `forEach`, `if` sem bloco, bindings prefixados com `_`, testes sem “Should”, testes em `src/`, navegação sem `resolve()` e listas Svelte sem chave. Os testes ficam em `tests/unit/`; `npm test` também verifica exemplos positivos e negativos dessas regras.
 
 O build compila cliente e servidor. O aviso final `adapter_missing` é esperado enquanto o destino de execução não for escolhido; deploy não foi escolhido nem autorizado. Dependências diretas estão fixadas em `package.json` e transitivas em `package-lock.json`.

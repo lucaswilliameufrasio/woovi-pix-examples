@@ -13,6 +13,7 @@ Este arquivo distingue implementação, testes automatizados e validação exter
 - [x] Capability de pedido emitida atomicamente na reserva, escopo/TTL próprios e BFF web com cookie HttpOnly e sessão local autorizada pelo cliente.
 - [x] Cliente mobile migrado para consulta privada, capability no armazenamento seguro e IDs sem autorização; testes de cliente com backend/PostgreSQL reais.
 - [x] Consulta anônima por ID encerrada: alias legado requer capability; operador possui consulta separada para diagnóstico de pedidos antigos.
+- [x] Primeiro E2E Chromium de UI/BFF/Go/PostgreSQL/simulador em schemas isolados, com sessão/replay e acesso por cookie.
 - [x] Web catálogo/reserva/acompanhamento e Flutter catálogo/pedido/histórico/polling.
 - [x] Skills locais e enforcement TypeScript por lint/testes.
 - [ ] Checkout merchant seguro e UI SDK efetivamente conectada ao pedido.
@@ -74,3 +75,9 @@ Formatação Dart/Go/Prettier/Ruff aplicada aos códigos alterados e checada, co
 Snapshots anteriores acima descrevem o estado de seus slices. Estado atual: GET `/v1/orders/{order_id}` exige a mesma capability da rota customer, com TTL/401/no-store, e não é público. GET `/v1/operator/orders/{order_id}` permite diagnóstico pelo operador sem reemitir token cliente. Smoke/roteiros migrados. Pedido sem capability não ganha acesso por ID; autenticação humana completa e produção ainda pendentes.
 
 Regressão demonstrou a falha original (200 anônimo) antes da correção; depois, suíte Go/PostgreSQL completa passou `-race -p=1 -count=3`, mais build/vet/gofmt/golangci-lint. Smokes API/BFF/mobile passaram duas vezes por modo em schemas independentes. Tooling: cinco testes, Ruff/format; Gitleaks backend/docs sem leaks. Nenhum sandbox/pagamento real/deploy/publicação.
+
+### Primeiro E2E Chromium — após publicação cf03359
+
+`@playwright/test` 1.63.0 fixado, modo `--browser` com duas fixtures isoladas, sem retries/reset. Teste de interface cobre reserva, HttpOnly/SameSite/TTL, ausência de credenciais no DOM/JS, contexto anônimo negado, restart de contexto com estado somente em memória, sessão idempotente e confirmação local/worker/retirada. PostgreSQL confirma pedido/evento/cobrança/sessão/chave únicos e dois grants. Sem segredo operacional no processo web/Chromium/página; traces/screenshots/vídeos/storageState em arquivo desabilitados. Primeiro fluxo E2E de navegador, **não toda a matriz** de concorrência/timeout/expiração/restart de backend. Keystore/Keychain e E2E mobile nativo pendentes; nenhum dispositivo conectado na inspeção local, emulador Android genérico disponível. Playwright usa fallback Ubuntu no host atual. Estas mudanças são posteriores ao commit publicado e não foram commitadas/pushadas novamente.
+
+Gates finais: 59 testes web, lint/check/format/build/audit; cinco testes Python/Ruff; smokes BFF/mobile 2x e Chromium 2x após esperar navegação explícita no replay. Houve uma falha intermitente de browser em execução paralela e um timeout inicial de ESLint sob carga alta do host; cinco execuções sequenciais de browser e a execução final passaram, assim como repetição unitária sem aumentar timeout. Causa do incidente paralelo não comprovada; estabilidade sob carga continua a investigar, não ocultada por retry automático.
