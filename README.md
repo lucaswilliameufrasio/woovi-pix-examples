@@ -18,4 +18,4 @@ Repositório público com demos independentes de Pix. Ferramentas são fixadas p
 | Click & collect   | Não implementada; terá backend, web, mobile e banco próprios.                                                                                                |
 | Reservas          | Não implementada; terá backend, web, mobile e banco próprios.                                                                                                |
 
-**O projeto não está concluído nem pronto para produção.** Existe um primeiro E2E Chromium local; matriz completa de browser, dispositivo mobile, sandbox real e build iOS continuam pendentes. Não use comprovante/callback da interface como autorização de entrega. Não pague códigos demonstrativos em banco real.
+**O projeto não está concluído nem pronto para produção.** Existem primeiros E2E Chromium e Android nativo em emulador; matriz completa de falhas, aparelhos físicos, sandbox real e build iOS continuam pendentes. Não use comprovante/callback da interface como autorização de entrega. Não pague códigos demonstrativos em banco real.

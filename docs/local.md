@@ -158,6 +158,14 @@ python3 tooling/run_offers_smoke.py --browser
 
 São duas execuções UI/BFF/backend/DB/simulador com reserva, cookie privado, sessão/replay, confirmação local/worker e retirada única; acesso apenas por link é negado em outro contexto. Sem traces/cookies em arquivo, segredo do operador na página ou chamadas PSP. Não equivale à matriz completa de E2E nem valida dispositivo mobile/Safari/iOS. Todos os modos são mutuamente exclusivos e usam schemas próprios sem apagar pedidos existentes.
 
+Para UI Android e armazenamento seguro **nativos**, inicie o perfil genérico `medium_phone`, confira o serial em `adb devices` e execute:
+
+```sh
+python3 tooling/run_offers_smoke.py --android-device emulator-5586
+```
+
+Substitua o serial pelo do perfil genérico. Esse modo é separado dos anteriores: duas fixtures, reserva/UI/worker com armazenamento real e duas execuções do processo do app por fixture, depois retirada/SQL pelo operador no harness. Usa `--no-uninstall` para conservar dados entre processos e `adb reverse` em portas próprias, sem reset do banco/app/AVD. Não leva token do operador/DB ao app. [Detalhes e limites](../ofertas-relampago/mobile/README.md#e2e-android-nativo): aparelho físico/iOS e matriz completa de falhas continuam pendentes.
+
 O runner compila o backend com mise, cria **schema exclusivo** de teste no PostgreSQL local, gera token em memória e inicia API/simulador em portas efêmeras. Não toca pedidos de outros schemas. Executa o smoke duas vezes em schemas separados e encerra seus próprios processos. Mantém os schemas de teste para inspeção; não reseta nem apaga dados. Isso funciona mesmo com a seed do banco principal já consumida.
 
 Se seu PostgreSQL da demo usa outro projeto Compose/porta, informe `SMOKE_COMPOSE_PROJECT` e `SMOKE_DATABASE_PORT`. O runner usa somente `127.0.0.1` e as credenciais didáticas documentadas; não aceita URL de banco remoto.

@@ -13,7 +13,7 @@ import time
 import re
 import uuid
 
-from smoke import offers_smoke, SmokeFailure
+from smoke import offers_smoke, SmokeFailure, Client
 from web_smoke import web_smoke
 
 
@@ -141,7 +141,89 @@ def run_web_smoke(api_addr, simulator_addr, logs, browser=False):
                 pass
 
 
-def one_run(binary, logs, web=False, mobile=False, browser=False):
+def native_test_command(device, phase, api_addr, simulator_addr):
+    return [
+        "fvm",
+        "flutter",
+        "test",
+        "integration_test/native_orders_test.dart",
+        "--no-uninstall",
+        "-d",
+        device,
+        "--dart-define=NATIVE_SMOKE_PHASE=" + phase,
+        "--dart-define=NATIVE_SMOKE_API_BASE=http://" + api_addr,
+        "--dart-define=NATIVE_SMOKE_SIM_BASE=http://" + simulator_addr,
+    ]
+
+
+def run_android_smoke(api_addr, simulator_addr, device):
+    if not re.fullmatch(r"emulator-[0-9]+", device):
+        raise SmokeFailure("Selecione explicitamente um emulador Android genérico.")
+    adb = ["adb", "-s", device]
+    names = checked(adb + ["emu", "avd", "name"]).splitlines()
+    if not names or names[0] != "medium_phone":
+        raise SmokeFailure(
+            "Somente o perfil genérico medium_phone é aceito; não usar dados de apps privados."
+        )
+    if checked(adb + ["shell", "getprop", "sys.boot_completed"]) != "1":
+        raise SmokeFailure("Emulador genérico ainda não concluiu boot.")
+    mappings = []
+    try:
+        existing = checked(adb + ["reverse", "--list"])
+        for address in (api_addr, simulator_addr):
+            port = address.rsplit(":", 1)[1]
+            mapping = "tcp:" + port
+            if any(mapping in row.split() for row in existing.splitlines()):
+                raise SmokeFailure(
+                    "Mapeamento adb existente: não sobrescrever conexão alheia."
+                )
+            checked(adb + ["reverse", mapping, mapping])
+            mappings.append(mapping)
+        native_env = {"HOME": os.environ["HOME"], "PATH": os.environ["PATH"]}
+        for phase in ("create", "restore"):
+            if phase == "restore":
+                checked(
+                    adb
+                    + [
+                        "shell",
+                        "am",
+                        "force-stop",
+                        "br.com.woovi.examples.ofertas_relampago_app",
+                    ]
+                )
+            command = native_test_command(device, phase, api_addr, simulator_addr)
+            process = subprocess.Popen(
+                command,
+                cwd=ROOT / "ofertas-relampago/mobile",
+                env=native_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            try:
+                process.communicate(timeout=360)
+            except subprocess.TimeoutExpired as failure:
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.communicate()
+                raise SmokeFailure(
+                    "E2E Android excedeu o prazo; output protegido e grupo próprio encerrado."
+                ) from failure
+            if process.returncode:
+                raise SmokeFailure(
+                    "E2E Android falhou na fase "
+                    + phase
+                    + "; output omitido para proteger credenciais."
+                )
+    finally:
+        for mapping in mappings:
+            checked(adb + ["reverse", "--remove", mapping])
+
+
+def one_run(binary, logs, web=False, mobile=False, browser=False, android_device=None):
     schema = "smoke_" + uuid.uuid4().hex
     checked(
         [
@@ -198,7 +280,48 @@ def one_run(binary, logs, web=False, mobile=False, browser=False):
                     "Startup não forneceu endereços locais dentro do prazo."
                 )
             os.environ["DEMO_OPERATOR_TOKEN"] = token
-            if mobile:
+            if android_device:
+                run_android_smoke(api_addr, simulator_addr, android_device)
+                order_id = checked(
+                    [
+                        "docker",
+                        "compose",
+                        "-p",
+                        DB_PROJECT,
+                        "exec",
+                        "-T",
+                        "postgres",
+                        "psql",
+                        "-U",
+                        "offers",
+                        "-d",
+                        "offers",
+                        "-At",
+                        "-v",
+                        "ON_ERROR_STOP=1",
+                        "-c",
+                        "SELECT id FROM " + schema + ".orders",
+                    ]
+                )
+                if not re.fullmatch(r"[a-f0-9]{32}", order_id):
+                    raise SmokeFailure(
+                        "Fixture Android não deixou um único pedido válido."
+                    )
+                api = Client("http://" + api_addr)
+                operator = "Bearer " + token
+                path = "/v1/operator/orders/" + order_id
+                credential = api.request(
+                    "POST", path + "/pickup-token", expected=201, token=operator
+                )
+                api.request("POST", path + "/pickup", body=credential, token=operator)
+                api.request(
+                    "POST",
+                    path + "/pickup",
+                    expected=409,
+                    body=credential,
+                    token=operator,
+                )
+            elif mobile:
                 mobile_env = {
                     "PATH": os.environ["PATH"],
                     "HOME": os.environ["HOME"],
@@ -273,11 +396,17 @@ def one_run(binary, logs, web=False, mobile=False, browser=False):
             }
             if mobile:
                 expected.update(events=0, charges=0, sessions=0, keys=0, grants=0)
+            if android_device:
+                expected.update(sessions=0, keys=0, grants=0)
             if json.loads(persisted) != expected:
                 raise SmokeFailure(
                     "Persistência PostgreSQL não corresponde ao fluxo confirmado."
                 )
-            if mobile:
+            if android_device:
+                print(
+                    "PASS Android UI/Keystore/HTTP/PostgreSQL: reserva, armazenamento nativo sem mock, persistência entre processos, worker/status/histórico e retirada única. Não valida iOS/Keychain."
+                )
+            elif mobile:
                 print(
                     "PASS mobile client/HTTP/PostgreSQL: reserva única, credencial segura simulada, restart, consulta privada e estoque autoritativo. Não é E2E de dispositivo."
                 )
@@ -318,6 +447,10 @@ def main():
         action="store_true",
         help="E2E Chromium UI real contra BFF/Go/PostgreSQL/simulador isolados, sem PSP.",
     )
+    modes.add_argument(
+        "--android-device",
+        help="E2E Android nativo em serial explícito do emulador genérico medium_phone já iniciado (ex.: emulator-5586).",
+    )
     args = parser.parse_args()
     try:
         temp_root = Path("/tmp/opencode") if Path("/tmp/opencode").is_dir() else None
@@ -336,6 +469,7 @@ def main():
                     web=args.web,
                     mobile=args.mobile,
                     browser=args.browser,
+                    android_device=args.android_device,
                 )
         print(
             "PASS isolated smoke: duas execuções completas, sem reset ou chamada PSP."

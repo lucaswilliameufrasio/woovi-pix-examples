@@ -1,7 +1,13 @@
 import importlib.util
 from pathlib import Path
 import unittest
-from run_offers_smoke import listening_addresses
+from unittest.mock import patch
+from run_offers_smoke import (
+    listening_addresses,
+    native_test_command,
+    run_android_smoke,
+    SmokeFailure,
+)
 
 spec = importlib.util.spec_from_file_location(
     "smoke", Path(__file__).with_name("smoke.py")
@@ -46,6 +52,30 @@ class SmokeSafetyTest(unittest.TestCase):
 
     def test_missing_startup_is_not_success(self):
         self.assertEqual(listening_addresses("startup failed"), (None, None))
+
+    def test_native_process_restart_preserves_app_installation_without_secrets(self):
+        for phase in ("create", "restore"):
+            command = native_test_command(
+                "emulator-5586", phase, "127.0.0.1:31001", "127.0.0.1:31002"
+            )
+            self.assertIn("--no-uninstall", command)
+            self.assertIn("--dart-define=NATIVE_SMOKE_PHASE=" + phase, command)
+            self.assertFalse(
+                any("TOKEN" in value or "DATABASE" in value for value in command)
+            )
+
+    def test_native_runner_refuses_ambiguous_and_non_generic_devices(self):
+        with patch("run_offers_smoke.checked") as command:
+            for device in ("", "usb-device", "localhost:5555"):
+                with self.assertRaises(SmokeFailure):
+                    run_android_smoke("127.0.0.1:31001", "127.0.0.1:31002", device)
+            command.assert_not_called()
+            for name in ("", "different-profile\nOK"):
+                command.return_value = name
+                with self.assertRaises(SmokeFailure):
+                    run_android_smoke(
+                        "127.0.0.1:31001", "127.0.0.1:31002", "emulator-5586"
+                    )
 
 
 if __name__ == "__main__":
