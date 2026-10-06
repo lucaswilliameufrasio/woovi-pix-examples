@@ -34,8 +34,8 @@ jobs:
     env:
       TEST_DATABASE_URL: postgres://offers:offers-local-only@127.0.0.1:5432/offers?sslmode=disable
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v5
       - name: Check Go formatting
         working-directory: ofertas-relampago/backend
         run: test -z "$(gofmt -l .)"
@@ -47,6 +47,7 @@ jobs:
         run: |
           mise exec -- go build ./...
           mise exec -- go vet ./...
+          docker build --tag woovi-offers-ci:local .
       - name: Lint
         working-directory: ofertas-relampago/backend
         run: mise exec -- go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0 run
@@ -55,8 +56,8 @@ jobs:
     name: SvelteKit web
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v5
       - working-directory: ofertas-relampago/web
         run: mise exec -- npm ci
       - name: Format, lint, types, and unit tests
@@ -79,8 +80,8 @@ jobs:
       SMOKE_COMPOSE_PROJECT: woovi-offers-ci
       SMOKE_DATABASE_PORT: 55440
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v5
       - name: Install web dependencies
         working-directory: ofertas-relampago/web
         run: mise exec -- npm ci
@@ -99,11 +100,13 @@ jobs:
     name: Python tooling
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
       - name: Lint, format, and test tooling
         run: |
           uvx ruff@0.14.10 check tooling
@@ -118,13 +121,13 @@ jobs:
       SMOKE_COMPOSE_PROJECT: woovi-offers-mobile-ci
       SMOKE_DATABASE_PORT: 55440
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
         with:
           repository: lucaswilliameufrasio/woovi-pix-flutter-sdk
           ref: a77fd5bccbfbf572a08580b0ef593dc540db47d9
           path: woovi-pix-flutter-sdk
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v5
       - name: Start isolated PostgreSQL for mobile integration
         run: docker compose -p "$SMOKE_COMPOSE_PROJECT" -f ofertas-relampago/backend/compose.yaml up -d --wait postgres
       - name: Link the pinned local SDK dependency

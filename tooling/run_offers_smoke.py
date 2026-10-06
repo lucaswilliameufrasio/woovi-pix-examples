@@ -42,6 +42,12 @@ def checked(command, cwd=BACKEND):
     return result.stdout.decode().strip()
 
 
+def worker_environment(api_env):
+    env = dict(api_env)
+    env.pop("DEMO_OPERATOR_TOKEN", None)
+    return env
+
+
 def run_web_smoke(api_addr, simulator_addr, logs, browser=False):
     log_path = logs / "web.log"
     env = {
@@ -156,6 +162,27 @@ def native_test_command(device, phase, api_addr, simulator_addr):
     ]
 
 
+def native_failure_summary(stdout, stderr):
+    text = (stdout or b"") + b"\n" + (stderr or b"")
+    patterns = (
+        re.compile(
+            r"(?:Expected:|Actual:|Which:|Test failed|Failure:|Exception|StateError|Error:|historyRefreshFailed=|native_orders_test\.dart:\d+)",
+            re.IGNORECASE,
+        ),
+    )
+    summary = []
+    for line in text.decode(errors="replace").splitlines():
+        if not any(pattern.search(line) for pattern in patterns):
+            continue
+        line = re.sub(r"(?i)bearer\s+\S+", "Bearer [REDACTED]", line)
+        line = re.sub(r"\b[0-9a-fA-F]{24,}\b", "[REDACTED_ID]", line)
+        line = re.sub(r"https?://[^\s'\"<>]+", "[REDACTED_URL]", line)
+        summary.append(line[:240])
+        if len(summary) == 8:
+            break
+    return " | ".join(summary) if summary else "Flutter diagnostic summary unavailable."
+
+
 def run_android_smoke(api_addr, simulator_addr, device):
     if not re.fullmatch(r"emulator-[0-9]+", device):
         raise SmokeFailure("Selecione explicitamente um emulador Android genérico.")
@@ -201,29 +228,42 @@ def run_android_smoke(api_addr, simulator_addr, device):
                 start_new_session=True,
             )
             try:
-                process.communicate(timeout=360)
+                stdout, stderr = process.communicate(timeout=360)
             except subprocess.TimeoutExpired as failure:
                 os.killpg(process.pid, signal.SIGTERM)
                 try:
-                    process.communicate(timeout=10)
+                    stdout, stderr = process.communicate(timeout=10)
                 except subprocess.TimeoutExpired:
                     os.killpg(process.pid, signal.SIGKILL)
-                    process.communicate()
+                    stdout, stderr = process.communicate()
                 raise SmokeFailure(
-                    "E2E Android excedeu o prazo; output protegido e grupo próprio encerrado."
+                    "E2E Android excedeu o prazo na fase "
+                    + phase
+                    + "; "
+                    + native_failure_summary(stdout, stderr)
+                    + " Grupo próprio encerrado."
                 ) from failure
             if process.returncode:
                 raise SmokeFailure(
                     "E2E Android falhou na fase "
                     + phase
-                    + "; output omitido para proteger credenciais."
+                    + "; "
+                    + native_failure_summary(stdout, stderr)
                 )
     finally:
         for mapping in mappings:
             checked(adb + ["reverse", "--remove", mapping])
 
 
-def one_run(binary, logs, web=False, mobile=False, browser=False, android_device=None):
+def one_run(
+    binary,
+    worker_binary,
+    logs,
+    web=False,
+    mobile=False,
+    browser=False,
+    android_device=None,
+):
     schema = "smoke_" + uuid.uuid4().hex
     checked(
         [
@@ -262,6 +302,7 @@ def one_run(binary, logs, web=False, mobile=False, browser=False, android_device
         process = subprocess.Popen(
             [str(binary)], cwd=BACKEND, env=env, stdout=output, stderr=output
         )
+        worker_process = None
         previous_token = os.environ.get("DEMO_OPERATOR_TOKEN")
         try:
             deadline = time.monotonic() + 20
@@ -278,6 +319,26 @@ def one_run(binary, logs, web=False, mobile=False, browser=False, android_device
             if not api_addr or not simulator_addr:
                 raise SmokeFailure(
                     "Startup não forneceu endereços locais dentro do prazo."
+                )
+            worker_process = subprocess.Popen(
+                [str(worker_binary)],
+                cwd=BACKEND,
+                env=worker_environment(env),
+                stdout=output,
+                stderr=output,
+            )
+            worker_deadline = time.monotonic() + 20
+            while time.monotonic() < worker_deadline:
+                if worker_process.poll() is not None:
+                    raise SmokeFailure(
+                        "Worker independente encerrou no startup; log local não exibido."
+                    )
+                if "background workers started" in log_path.read_text():
+                    break
+                time.sleep(0.1)
+            else:
+                raise SmokeFailure(
+                    "Worker independente não confirmou startup dentro do prazo."
                 )
             os.environ["DEMO_OPERATOR_TOKEN"] = token
             if android_device:
@@ -419,13 +480,14 @@ def one_run(binary, logs, web=False, mobile=False, browser=False, android_device
                 os.environ.pop("DEMO_OPERATOR_TOKEN", None)
             else:
                 os.environ["DEMO_OPERATOR_TOKEN"] = previous_token
-            if process.poll() is None:
-                process.send_signal(signal.SIGINT)
-                try:
-                    process.wait(timeout=8)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+            for child in (worker_process, process):
+                if child is not None and child.poll() is None:
+                    child.send_signal(signal.SIGINT)
+                    try:
+                        child.wait(timeout=8)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.wait()
             print("Schema sintético mantido para inspeção:", schema)
 
 
@@ -459,12 +521,26 @@ def main():
         ) as directory:
             workspace = Path(directory)
             binary = workspace / "offers"
+            worker_binary = workspace / "offers-worker"
             checked(
                 ["mise", "exec", "--", "go", "build", "-o", str(binary), "./cmd/offers"]
+            )
+            checked(
+                [
+                    "mise",
+                    "exec",
+                    "--",
+                    "go",
+                    "build",
+                    "-o",
+                    str(worker_binary),
+                    "./cmd/offers-worker",
+                ]
             )
             for _ in range(2):
                 one_run(
                     binary,
+                    worker_binary,
                     workspace,
                     web=args.web,
                     mobile=args.mobile,

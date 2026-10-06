@@ -7,6 +7,8 @@ from run_offers_smoke import (
     native_test_command,
     run_android_smoke,
     SmokeFailure,
+    native_failure_summary,
+    worker_environment,
 )
 
 spec = importlib.util.spec_from_file_location(
@@ -76,6 +78,34 @@ class SmokeSafetyTest(unittest.TestCase):
                     run_android_smoke(
                         "127.0.0.1:31001", "127.0.0.1:31002", "emulator-5586"
                     )
+
+    def test_worker_environment_does_not_receive_operator_credential(self):
+        api_env = {
+            "DATABASE_URL": "postgres://local-fixture",
+            "DEMO_MODE": "true",
+            "DEMO_OPERATOR_TOKEN": "operator-secret-fixture",
+        }
+        sanitized = worker_environment(api_env)
+        self.assertEqual(sanitized["DATABASE_URL"], api_env["DATABASE_URL"])
+        self.assertEqual(sanitized["DEMO_MODE"], "true")
+        self.assertNotIn("DEMO_OPERATOR_TOKEN", sanitized)
+        self.assertIn("DEMO_OPERATOR_TOKEN", api_env)
+
+    def test_native_failure_summary_keeps_assertion_and_redacts_sensitive_values(self):
+        output = (
+            b"Expected: <paid>\n"
+            b"Actual: <pending>\n"
+            b"Exception: Bearer secret-token-with-long-value\n"
+            b"order id 0123456789abcdef0123456789abcdef\n"
+            b"http://127.0.0.1:54321/v1/orders?token=private\n"
+        )
+        summary = native_failure_summary(output, b"")
+        self.assertIn("Expected: <paid>", summary)
+        self.assertIn("Actual: <pending>", summary)
+        self.assertNotIn("secret-token-with-long-value", summary)
+        self.assertNotIn("0123456789abcdef0123456789abcdef", summary)
+        self.assertNotIn("127.0.0.1", summary)
+        self.assertNotIn("token=private", summary)
 
 
 if __name__ == "__main__":

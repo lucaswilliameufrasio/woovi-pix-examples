@@ -17,16 +17,27 @@ Demo educativa de checkout para uma oferta de estoque limitado. O banco e o simu
 
 ## Executar
 
+Inicie PostgreSQL e API no primeiro terminal. O worker roda em processo independente no segundo terminal.
+
 ```sh
 docker compose -p woovi-offers up -d --wait postgres
 export DATABASE_URL='postgres://offers:offers-local-only@127.0.0.1:55440/offers?sslmode=disable'
 export TEST_DATABASE_URL="$DATABASE_URL"
 export DEMO_MODE=true
 export DEMO_OPERATOR_TOKEN="$(openssl rand -hex 32)" # secreto local; nunca commitar
-go run ./cmd/offers
+mise exec -- go run ./cmd/offers
 ```
 
-A API fica em `http://127.0.0.1:8080`; simulador em `http://127.0.0.1:8081`. Ajuste `API_ADDR`/`SIMULATOR_ADDR` se essas portas estiverem ocupadas. Use `:0` para obter portas efêmeras (os endereços escolhidos aparecem nos logs e o próprio processo configura o endereço interno da API para o simulador). A oferta seed `demo-offer` tem uma unidade. O modo demo habilita rotas `/dev`; não as habilite em deployments reais. API e simulador são independentes do restante do monorepo.
+No segundo terminal, use o mesmo `DATABASE_URL` e `DEMO_MODE`; não é necessário compartilhar o token de operador:
+
+```sh
+cd ofertas-relampago/backend
+export DATABASE_URL='postgres://offers:offers-local-only@127.0.0.1:55440/offers?sslmode=disable'
+export DEMO_MODE=true
+mise exec -- go run ./cmd/offers-worker
+```
+
+A API fica em `http://127.0.0.1:8080`; simulador em `http://127.0.0.1:8081`. Ajuste `API_ADDR`/`SIMULATOR_ADDR` se essas portas estiverem ocupadas. Use `:0` para obter portas efêmeras (os endereços escolhidos aparecem nos logs e o próprio processo configura o endereço interno da API para o simulador). A oferta seed `demo-offer` tem uma unidade. O modo demo habilita rotas `/dev`; não as habilite em deployments reais. API, simulador e worker são processos independentes; todos usam o mesmo banco local e permanecem isolados do restante do monorepo. O Dockerfile inclui `/offers` e `/offers-worker`, com a API como entrypoint padrão; para o worker, substitua o entrypoint por `/offers-worker`.
 A API e o simulador exigem `DEMO_MODE=true` e só aceitam bind em IP loopback (`127.0.0.1` ou `::1`); esta versão não suporta deployment nem chamadas PSP reais.
 
 ## Fluxo HTTP
@@ -68,6 +79,7 @@ Com PostgreSQL real disponível:
 ```sh
 TEST_DATABASE_URL="$DATABASE_URL" go test -p=1 -count=3 -race ./...
 go build ./...
+go build ./cmd/offers-worker
 gofmt -l .
 golangci-lint run ./...
 ```

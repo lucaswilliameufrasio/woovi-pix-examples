@@ -11,7 +11,7 @@ Comandos em Bash, partindo da raiz de `woovi-pix-examples`, salvo indicação co
 
 Não coloque credenciais Woovi em nenhum destes comandos. Os dados de conexão abaixo são didáticos, exclusivamente do PostgreSQL local.
 
-## 2. API, banco, seed e worker — terminal 1
+## 2. API e banco — terminal 1
 
 ```sh
 mise install
@@ -26,11 +26,24 @@ export DEMO_OPERATOR_TOKEN
 mise exec -- go run ./cmd/offers
 ```
 
-API `127.0.0.1:8080`; simulador persistido `127.0.0.1:8081`; banco `127.0.0.1:55440`. Migrações e seed são aplicadas no startup. API, worker de pagamento (250 ms) e expiração (1 s) rodam no mesmo processo nesta implementação. Ainda não há comando de worker independente.
+API `127.0.0.1:8080`; simulador persistido `127.0.0.1:8081`; banco `127.0.0.1:55440`. Migrações e seed são aplicadas no startup.
+
+## 3. Worker — terminal 2
+
+O worker de eventos de pagamento e o expirador agora rodam num processo independente. Abra outro terminal, configure somente o acesso ao mesmo PostgreSQL e o modo local; o token do operador não é necessário:
+
+```sh
+cd ofertas-relampago/backend
+export DATABASE_URL='postgres://offers:offers-local-only@127.0.0.1:55440/offers?sslmode=disable'
+export DEMO_MODE=true
+mise exec -- go run ./cmd/offers-worker
+```
+
+O worker aplica as migrações idempotentes no startup, executa eventos a cada 250 ms e expiração a cada segundo, e encerra ambas as rotinas ao receber Ctrl-C. API e worker devem apontar para o mesmo banco. Em container da imagem backend, use `--entrypoint /offers-worker`; o entrypoint padrão continua sendo a API.
 
 A seed `demo-offer` tem **uma unidade, R$ 25,00 e TTL de 120 segundos**. Restart não repõe estoque. Para portas ocupadas, configure `API_ADDR` e `SIMULATOR_ADDR` com IP loopback literal e porta; `:0` escolhe portas efêmeras, mostradas nos logs. Atualize as URLs dos clientes conforme os endereços escolhidos.
 
-## 3. Escolher uma interface — terminal 2
+## 4. Escolher uma interface — terminal 3
 
 ### Web
 
@@ -61,7 +74,7 @@ Web e mobile disputam a mesma última unidade: não reserve nas duas interfaces 
 
 Em dispositivo Android físico conectado por USB, uma alternativa local é `adb reverse tcp:8080 tcp:8080` e `API_BASE_URL=http://127.0.0.1:8080`. Não abra o backend em `0.0.0.0` para contornar isolamento. Para iOS no mesmo Mac, a URL é loopback; build/ATS e execução iOS continuam sem validação neste projeto.
 
-## 4. Confirmar o pedido sem dinheiro — terminal 3
+## 5. Confirmar o pedido sem dinheiro — terminal 4
 
 Para criar pelo HTTP em vez de uma interface, execute **uma vez** e capture o ID:
 
@@ -98,7 +111,7 @@ Execute o helper Python na raiz. Repita somente a consulta, não a reserva/cobra
 
 Se executar o fluxo manual em outro terminal, defina `API`/`SIM` nele também. Não imprima/copiei o segredo do operador no chat, nem use `curl -v` com autenticação.
 
-## 5. Retirada autenticada
+## 6. Retirada autenticada
 
 Use o mesmo `DEMO_OPERATOR_TOKEN` fornecido ao processo da API, obtido no seu gerenciador local por entrada oculta; não coloque o valor literal em comandos/histórico. O token não fica no browser nem no app. A ferramenta de smoke isolado abaixo gera seu próprio token em memória e dispensa esse transporte manual.
 
@@ -121,7 +134,7 @@ PY
 
 Execute este bloco na raiz do repositório. O helper envia a credencial somente no header/corpo correto e não imprime seu valor. Repetir retirada com o mesmo token é recusado. O smoke abaixo também verifica rotação e reuso.
 
-## 6. Smoke automatizado HTTP real
+## 7. Smoke automatizado HTTP real
 
 ### Opção recomendada: fixture isolada automática
 

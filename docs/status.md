@@ -1,6 +1,6 @@
 # Checklist de entrega
 
-Este arquivo distingue implementação, testes automatizados e validação externa. Commit/push não significam plano concluído.
+Este arquivo distingue implementação, testes automatizados e validação externa. Commit/push não significam plano concluído. O backlog sequenciado está em [roadmap.md](roadmap.md).
 
 ## Ofertas
 
@@ -23,7 +23,8 @@ Este arquivo distingue implementação, testes automatizados e validação exter
 - [x] Primeiros E2E Playwright e Flutter Android contra backend/DB em schemas isolados (não cobrem a matriz completa).
 - [ ] Matriz ampliada de E2E: falhas, timeout, expiração, concorrência e restart de backend/app em plataformas suportadas.
 - [ ] Isolamento de DB/schema por pacote para executar suítes Go em paralelo.
-- [ ] Worker independente, OpenAPI completo e CI reproduzível por demo.
+- [x] Worker independente de eventos/expiração para a demo ofertas; validação PostgreSQL e smoke de processos separados.
+- [ ] OpenAPI completo e CI reproduzível por todas as demos. CI hosted de ofertas passou no commit `1e4af23`; revisões locais ainda não publicadas.
 
 ## Outras demos
 
@@ -39,6 +40,18 @@ Este arquivo distingue implementação, testes automatizados e validação exter
 - [ ] Sandbox real autorizado e validado; cadastro sem documentos/credenciais de terceiros.
 - [ ] iOS validado em macOS.
 - [ ] Deploy/produção, identidade completa, webhook criptográfico e revisão de ameaças.
+
+### Worker independente — validação local
+
+Os loops de pagamento e expiração foram extraídos do processo HTTP para `cmd/offers-worker`. API e worker compartilham o store/migração existente, rodam como processos distintos e recebem context cancellation em SIGINT/SIGTERM; o token de operador não é repassado ao worker pelo harness. O Dockerfile contém os dois executáveis, com API como entrypoint padrão.
+
+Validação desta fatia: PostgreSQL real, suíte Go `-race -p=1 -count=3`, build, vet, gofmt, golangci-lint 0 issues e Docker build passaram. Smokes `--browser`, `--web` e `--mobile` passaram duas fixtures cada com processos API+worker distintos e schemas isolados. A corrida Android descrita abaixo foi encontrada durante esta validação. Testes verificam shutdown, modo local obrigatório e ausência do token operador no ambiente do worker. Checkout não foi publicado nesta etapa; Actions verde anterior é SHA `1e4af23`, antes destas mudanças.
+
+### Correção da corrida Android restore — 06/10/2026
+
+Falha reproduzida: abrir “Meus pedidos” durante a carga iniciada pelo `initState` fazia `_loadOrderHistory()` retornar imediatamente quando `_loadingHistory` já era true; o modal então era construído antes da carga concorrente terminar, podendo ficar vazio e fazer o E2E falhar na fase `restore`. Um widget test com resposta HTTP adiada reproduziu a falha antes da correção. Agora chamadas simultâneas compartilham/aguardam a mesma `Future`; o modal abre depois da carga. O runner também reporta um resumo allowlistado e sanitizado das falhas Flutter, sem imprimir IDs longos, bearer tokens ou URLs.
+
+Após a correção passaram: widget regression + teste single-flight existente, suíte Flutter completa (18 testes, um teste backend omitido pelo comando padrão), analyze/format e APK debug; Android `medium_phone` com API/worker/PostgreSQL reais, 10 execuções consecutivas completas (20 fases create/restore), cada uma em schema isolado; cliente mobile/PostgreSQL em duas fixtures; tooling Python 9 testes/Ruff. Isso valida a corrida observada neste emulador genérico, não iOS, aparelho físico, Android CI ou a matriz global.
 
 As suites existentes de Go/PostgreSQL, web e Flutter são executadas antes de registrar cada entrega. Smoke HTTP complementa, não substitui testes de UI. Confira o resultado mais recente no relatório da execução; não interprete checkboxes como evidência de sandbox ou dispositivo.
 

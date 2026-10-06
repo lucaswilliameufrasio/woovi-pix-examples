@@ -248,6 +248,40 @@ void main() {
     },
   );
 
+  testWidgets('opening history waits for the initial history request', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({
+      'offers.order_history': ['slow-order'],
+    });
+    seedAccess(['slow-order']);
+    final pendingResponse = Completer<http.Response>();
+    final client = MockClient((request) async {
+      if (request.url.path == '/v1/offers') return http.Response('[]', 200);
+      return pendingResponse.future;
+    });
+    await tester.pumpWidget(
+      FlashOffersApp(
+        api: OffersApi(baseUrl: 'http://127.0.0.1:8080', client: client),
+      ),
+    );
+    await tester.pump();
+    await tester.tap(find.byTooltip('Meus pedidos'));
+    await tester.pump();
+    expect(find.text('Meus pedidos'), findsNothing);
+
+    pendingResponse.complete(
+      http.Response(
+        jsonEncode({'id': 'slow-order', 'amount_cents': 2500, 'state': 'paid'}),
+        200,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Pedido slow-order'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('history refresh is single-flight and safe after closing modal', (
     tester,
   ) async {

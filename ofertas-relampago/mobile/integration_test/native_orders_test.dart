@@ -44,6 +44,33 @@ Future<void> simulatedPayment(Uri simulator, String orderId) async {
   }
 }
 
+Future<void> pumpUntilVisible(WidgetTester tester, Finder finder) async {
+  for (var frame = 0; frame < 300; frame++) {
+    if (finder.evaluate().isNotEmpty) return;
+    await tester.pump(const Duration(milliseconds: 100));
+  }
+  final refreshFailed = find
+      .text('Não foi possível consultar seus pedidos agora. Tente atualizar.')
+      .evaluate()
+      .isNotEmpty;
+  final accessMissing = find
+      .text(
+        'Há pedidos sem acesso seguro ou com acesso expirado. O histórico e o ID não autorizam consulta. Procure o operador; não repita a reserva.',
+      )
+      .evaluate()
+      .isNotEmpty;
+  final emptyHistory = find
+      .text('Seus pedidos feitos neste aparelho aparecem aqui.')
+      .evaluate()
+      .isNotEmpty;
+  final loading = find.byType(CircularProgressIndicator).evaluate().isNotEmpty;
+  throw StateError(
+    'restore state: accessMissing=$accessMissing emptyHistory=$emptyHistory '
+    'loading=$loading refreshFailed=$refreshFailed; '
+    'persisted order did not appear within 30 s.',
+  );
+}
+
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
   const phase = String.fromEnvironment('NATIVE_SMOKE_PHASE');
@@ -126,8 +153,9 @@ void main() {
       // This process has no memory grant and no injected mock storage.
       expect((await api.getOrder(orderId)).state, 'paid');
       await tester.tap(find.byTooltip('Meus pedidos'));
-      await tester.pumpAndSettle();
-      expect(find.text('Pedido $orderId'), findsOneWidget);
+      final historyOrder = find.text('Pedido $orderId');
+      await pumpUntilVisible(tester, historyOrder);
+      expect(historyOrder, findsOneWidget);
       expect(find.text('Pago'), findsOneWidget);
     }
     await tester.pumpWidget(const SizedBox.shrink());

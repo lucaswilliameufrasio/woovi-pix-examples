@@ -84,6 +84,7 @@ class _OffersHomeState extends State<OffersHome> with WidgetsBindingObserver {
   bool _historyRefreshFailed = false;
   bool _historyAccessMissing = false;
   bool _orderAccessUnavailable = false;
+  Future<void>? _historyLoad;
   DemoOrder? _order;
   String? _error;
   String? _orderError;
@@ -238,8 +239,17 @@ class _OffersHomeState extends State<OffersHome> with WidgetsBindingObserver {
     _pollInterval = Duration(seconds: nextSeconds);
   }
 
-  Future<void> _loadOrderHistory() async {
-    if (_loadingHistory) return;
+  Future<void> _loadOrderHistory() {
+    final activeLoad = _historyLoad;
+    if (activeLoad != null) return activeLoad;
+    final load = _loadOrderHistoryOnce();
+    _historyLoad = load;
+    return load.whenComplete(() {
+      if (identical(_historyLoad, load)) _historyLoad = null;
+    });
+  }
+
+  Future<void> _loadOrderHistoryOnce() async {
     setState(() => _loadingHistory = true);
     try {
       final preferences = await SharedPreferences.getInstance();

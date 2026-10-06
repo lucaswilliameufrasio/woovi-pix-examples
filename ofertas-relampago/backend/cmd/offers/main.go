@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/lucaseufrasio/woovi-pix-examples/ofertas-relampago/backend/internal/httpapi"
@@ -19,7 +20,7 @@ import (
 )
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	storeURL := env("DATABASE_URL", "postgres://offers:offers-local-only@localhost:55431/offers?sslmode=disable")
 	st, err := store.Open(ctx, storeURL)
@@ -76,8 +77,6 @@ func main() {
 		slog.Info("simulator listening", "addr", simListener.Addr().String())
 		errCh <- simServer.Serve(simListener)
 	}()
-	go runWorker(ctx, st)
-	go runExpirer(ctx, st)
 	select {
 	case <-ctx.Done():
 	case err := <-errCh:
@@ -118,42 +117,6 @@ func simulatorHandler(st *store.Store) http.Handler {
 		return nil
 	})
 	return base.Handler()
-}
-
-func runWorker(ctx context.Context, st *store.Store) {
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			workerCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			_, err := st.ProcessPaymentEvents(workerCtx, 32)
-			cancel()
-			if err != nil {
-				slog.Error("payment event processing failed", "error", err)
-			}
-		}
-	}
-}
-
-func runExpirer(ctx context.Context, st *store.Store) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			jobCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			_, err := st.ExpireOrders(jobCtx)
-			cancel()
-			if err != nil {
-				slog.Error("order expiration failed", "error", err)
-			}
-		}
-	}
 }
 
 func env(key, fallback string) string {
