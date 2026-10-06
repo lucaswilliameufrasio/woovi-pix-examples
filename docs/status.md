@@ -20,7 +20,8 @@ Este arquivo distingue implementação, testes automatizados e validação exter
 - [ ] Checkout merchant seguro e UI SDK efetivamente conectada ao pedido.
 - [ ] Adapter PSP/simulador HTTP Woovi conectado à demo, não apenas smoke de fronteira.
 - [ ] MCP com cobrança correlacionada e autorização do domínio.
-- [ ] E2E Playwright e Flutter dispositivo contra backend/DB.
+- [x] Primeiros E2E Playwright e Flutter Android contra backend/DB em schemas isolados (não cobrem a matriz completa).
+- [ ] Matriz ampliada de E2E: falhas, timeout, expiração, concorrência e restart de backend/app em plataformas suportadas.
 - [ ] Isolamento de DB/schema por pacote para executar suítes Go em paralelo.
 - [ ] Worker independente, OpenAPI completo e CI reproduzível por demo.
 
