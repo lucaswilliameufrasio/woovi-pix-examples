@@ -1,0 +1,156 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Go and PostgreSQL
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18.6-alpine
+        env:
+          POSTGRES_USER: offers
+          POSTGRES_PASSWORD: offers-local-only
+          POSTGRES_DB: offers
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U offers -d offers"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://offers:offers-local-only@127.0.0.1:5432/offers?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Check Go formatting
+        working-directory: ofertas-relampago/backend
+        run: test -z "$(gofmt -l .)"
+      - name: Test with PostgreSQL and race detector
+        working-directory: ofertas-relampago/backend
+        run: mise exec -- go test -race -p=1 -count=3 ./...
+      - name: Build and vet
+        working-directory: ofertas-relampago/backend
+        run: |
+          mise exec -- go build ./...
+          mise exec -- go vet ./...
+      - name: Lint
+        working-directory: ofertas-relampago/backend
+        run: mise exec -- go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0 run
+
+  web:
+    name: SvelteKit web
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - working-directory: ofertas-relampago/web
+        run: mise exec -- npm ci
+      - name: Format, lint, types, and unit tests
+        working-directory: ofertas-relampago/web
+        run: |
+          mise exec -- npm run format:check
+          mise exec -- npm run lint
+          mise exec -- npm run check
+          mise exec -- npm test
+      - name: Production build and dependency audit
+        working-directory: ofertas-relampago/web
+        run: |
+          mise exec -- npm run build
+          mise exec -- npm audit --audit-level=high
+
+  browser-e2e:
+    name: Chromium against isolated PostgreSQL
+    runs-on: ubuntu-24.04
+    env:
+      SMOKE_COMPOSE_PROJECT: woovi-offers-ci
+      SMOKE_DATABASE_PORT: 55440
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Install web dependencies
+        working-directory: ofertas-relampago/web
+        run: mise exec -- npm ci
+      - name: Install Chromium and OS dependencies
+        run: mise exec -- npx --no-install playwright install --with-deps chromium
+        working-directory: ofertas-relampago/web
+      - name: Start isolated PostgreSQL
+        run: docker compose -p "$SMOKE_COMPOSE_PROJECT" -f ofertas-relampago/backend/compose.yaml up -d --wait postgres
+      - name: Run isolated browser E2E twice
+        run: python3 tooling/run_offers_smoke.py --browser
+      - name: Stop PostgreSQL without deleting its volume
+        if: always()
+        run: docker compose -p "$SMOKE_COMPOSE_PROJECT" -f ofertas-relampago/backend/compose.yaml stop postgres
+
+  tooling:
+    name: Python tooling
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v6
+      - name: Lint, format, and test tooling
+        run: |
+          uvx ruff@0.14.10 check tooling
+          uvx ruff@0.14.10 format --check tooling
+          python3 -m unittest discover -s tooling -p 'test_*.py'
+          python3 -m compileall -q tooling
+
+  mobile:
+    name: Flutter analyze, tests, and Android build
+    runs-on: ubuntu-24.04
+    env:
+      SMOKE_COMPOSE_PROJECT: woovi-offers-mobile-ci
+      SMOKE_DATABASE_PORT: 55440
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: lucaswilliameufrasio/woovi-pix-flutter-sdk
+          ref: a77fd5bccbfbf572a08580b0ef593dc540db47d9
+          path: woovi-pix-flutter-sdk
+      - uses: jdx/mise-action@v2
+      - name: Start isolated PostgreSQL for mobile integration
+        run: docker compose -p "$SMOKE_COMPOSE_PROJECT" -f ofertas-relampago/backend/compose.yaml up -d --wait postgres
+      - name: Link the pinned local SDK dependency
+        run: ln -s "$GITHUB_WORKSPACE/woovi-pix-flutter-sdk" "$GITHUB_WORKSPACE/../woovi-pix-flutter-sdk"
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.6"
+          channel: stable
+          cache: true
+      - name: Install FVM
+        run: |
+          dart pub global activate fvm
+          echo "$HOME/.pub-cache/bin" >> "$GITHUB_PATH"
+      - name: Resolve dependencies, format, analyze, and test
+        working-directory: ofertas-relampago/mobile
+        run: |
+          fvm install
+          fvm flutter pub get
+          fvm dart format --output=none --set-exit-if-changed lib test integration_test
+          fvm flutter analyze
+          fvm flutter test
+      - name: Build Android debug APK
+        working-directory: ofertas-relampago/mobile
+        run: fvm flutter build apk --debug
+      - name: Test Flutter client against real API and PostgreSQL
+        run: python3 tooling/run_offers_smoke.py --mobile
+      - name: Stop PostgreSQL without deleting its volume
+        if: always()
+        run: docker compose -p "$SMOKE_COMPOSE_PROJECT" -f ofertas-relampago/backend/compose.yaml stop postgres
