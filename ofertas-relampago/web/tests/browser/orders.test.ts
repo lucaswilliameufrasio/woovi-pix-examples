@@ -221,6 +221,14 @@ it("Should reserve through the browser, keep credentials private and reflect loc
     { pickup_token: pickup.pickup_token },
   );
   expect(duplicate.error_code).toBe("PICKUP_ALREADY_DONE");
+  // Losing the browser capability must not render the previously paid state.
+  await context.clearCookies();
+  const revoked = await page.goto(web + href);
+  expect(revoked?.status()).toBe(401);
+  await expect(
+    page.getByRole("heading", { name: "Pagamento registrado" }),
+  ).toHaveCount(0);
+  expect((await page.content()).includes(access.value)).toBe(false);
   expect(remoteRequests).toEqual([]);
   expect(pageErrors).toEqual([]);
 });
