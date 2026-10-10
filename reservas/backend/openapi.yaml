@@ -1,0 +1,225 @@
+openapi: 3.1.0
+info:
+  title: Reservas Demo API
+  version: 1.0.0
+  description: API local de agenda e reservas. Não integra PSP e não gera payload Pix.
+servers:
+  - url: http://127.0.0.1:8084
+    description: Loopback only
+paths:
+  /healthz:
+    get:
+      summary: Verificar disponibilidade da API
+      operationId: health
+      security: []
+      responses:
+        '200':
+          description: API disponível
+  /v1/availability:
+    get:
+      summary: Listar horários disponíveis
+      operationId: listAvailableSlots
+      security: []
+      parameters:
+        - name: date
+          in: query
+          required: true
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: Horários calculados pelo backend em UTC com rótulo local e fuso IANA
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [resource_id, resource_name, time_zone, price_cents, duration_minutes, buffer_minutes, slots]
+                properties:
+                  resource_id: { type: string }
+                  resource_name: { type: string }
+                  time_zone: { type: string }
+                  price_cents: { type: integer }
+                  duration_minutes: { type: integer }
+                  buffer_minutes: { type: integer }
+                  slots:
+                    type: array
+                    items: { $ref: '#/components/schemas/Slot' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /v1/reservations:
+    post:
+      summary: Reter um horário
+      operationId: createReservationHold
+      security: []
+      description: Cria uma retenção de 5 minutos no preço vigente do backend. Timeout pode ter resultado incerto; não repetir às cegas.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [starts_at]
+              properties:
+                starts_at: { type: string, format: date-time }
+      responses:
+        '201':
+          description: Hold criado; capability mostrada uma única vez
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [reservation, capability]
+                properties:
+                  reservation: { $ref: '#/components/schemas/Reservation' }
+                  capability: { type: string, format: password, minLength: 64, maxLength: 64 }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /v1/reservations/{reservation_id}:
+    parameters:
+      - $ref: '#/components/parameters/ReservationID'
+    get:
+      summary: Consultar reserva privada
+      operationId: getPrivateReservation
+      security: [{ ReservationCapability: [] }]
+      responses:
+        '200':
+          description: Reserva privada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Reservation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/reservations/{reservation_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/ReservationID'
+    post:
+      summary: Cancelar retenção
+      operationId: cancelReservationHold
+      security: [{ ReservationCapability: [] }]
+      responses:
+        '200':
+          description: Reserva cancelada e agenda liberada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Reservation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/simulator/reservations/{reservation_id}/paid:
+    parameters:
+      - $ref: '#/components/parameters/ReservationID'
+    post:
+      summary: Simular evento local de pagamento
+      operationId: simulatePaidEvent
+      description: Persistência de evento sintético idempotente; pagamentos tardios viram exceção e nunca reacquirem horários.
+      security: [{ DemoSimulatorToken: [] }]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 16, maxLength: 128 }
+      responses:
+        '202': { description: Evento local persistido para worker }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/operator/reservations:
+    get:
+      summary: Listar reservas para operador local
+      operationId: listOperatorReservations
+      security: [{ DemoOperatorToken: [] }]
+      responses:
+        '200':
+          description: Reservas confirmadas, concluídas ou com exceção
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Reservation' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/operator/reservations/{reservation_id}/complete:
+    parameters:
+      - $ref: '#/components/parameters/ReservationID'
+    post:
+      summary: Marcar reserva paga como concluída
+      operationId: completeReservation
+      security: [{ DemoOperatorToken: [] }]
+      responses:
+        '204': { description: Reserva paga concluída após o encerramento do horário agendado }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+components:
+  securitySchemes:
+    ReservationCapability:
+      type: http
+      scheme: bearer
+      description: Capability aleatória de posse, persistida como hash; não usar ID como autenticação.
+    DemoSimulatorToken:
+      type: http
+      scheme: bearer
+      description: Segredo apenas local para o simulador didático; nunca incorporar no cliente.
+    DemoOperatorToken:
+      type: http
+      scheme: bearer
+      description: Segredo apenas local para operação didática.
+  parameters:
+    ReservationID:
+      name: reservation_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  schemas:
+    Slot:
+      type: object
+      required: [starts_at, ends_at, local_label, time_zone]
+      properties:
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+        local_label: { type: string }
+        time_zone: { type: string }
+    Reservation:
+      type: object
+      required: [id, resource_id, starts_at, ends_at, local_label, time_zone, amount_cents, reservation_state, payment_state, expires_at]
+      properties:
+        id: { type: string, format: uuid }
+        resource_id: { type: string }
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+        local_label: { type: string }
+        time_zone: { type: string }
+        amount_cents: { type: integer }
+        reservation_state:
+          type: string
+          enum: [held, confirmed, completed, expired, cancelled]
+        payment_state:
+          type: string
+          enum: [pending, paid, expired, cancelled, payment_exception]
+        expires_at: { type: string, format: date-time }
+    Error:
+      type: object
+      required: [message, error_code]
+      properties:
+        message: { type: string }
+        error_code: { type: string }
+        extra: { type: object, additionalProperties: true }
+  responses:
+    BadRequest:
+      description: Requisição malformada
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unprocessable:
+      description: Parâmetros semanticamente inválidos
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Conflito de estado ou horário indisponível
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Capability ou segredo inválido
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Reserva não encontrada
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }

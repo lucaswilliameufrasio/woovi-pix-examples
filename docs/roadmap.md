@@ -47,23 +47,48 @@ Este roadmap reúne o trabalho que ainda falta nas três demos. É uma sequênci
 
 ## 4. Click & collect — demo vertical independente
 
-- [ ] Confirmar linguagem de domínio, atores e estados: catálogo/produto, pedido, preparo, pronto e retirado; definir cancelamento, indisponibilidade e pagamento tardio.
-- [ ] Criar backend e schema PostgreSQL próprios, preço autoritativo, reserva de estoque concorrente e autorização server-side para transições.
-- [ ] Criar web/BFF e app Flutter próprios; manter secrets fora do browser e credenciais de pedido no armazenamento apropriado do mobile.
-- [ ] Implementar worker/outbox somente conforme necessidade comprovada; qualquer confirmação de pagamento deve ser persistida e idempotente.
+### Base de domínio para o MVP
+
+- **Cliente:** vê o catálogo, reserva exatamente uma unidade, acompanha pelo acesso privado retornado na reserva e apresenta código de retirada depois que o pedido estiver pronto. ID/histórico local não autorizam consulta.
+- **Operador da loja:** usa autenticação local de demo para consultar a fila, iniciar preparo, marcar pronto e conferir/consumir a retirada uma única vez. Isto não representa login humano de produção.
+- **Simulador/worker:** confirma somente pagamentos sintéticos via evento persistido; não cria Pix ou chama PSP.
+- **Escopo inicial:** uma loja e um produto físico seedado; uma unidade por pedido; estoque e banco exclusivos desta demo. Catálogo permanente e preparo diferenciam este fluxo das ofertas-relâmpago.
+- **Estados separados:** pagamento (`pending`, `paid`, `expired`, `cancelled`, `payment_exception`) não se mistura com fulfillment (`awaiting_payment`, `preparing`, `ready_for_pickup`, `picked_up`). Só pagamento confirmado permite iniciar preparo; só `ready_for_pickup` permite retirada. Pagamento tardio não reabre estoque nem autoriza entrega automaticamente.
+- **Cancelamento MVP:** cliente cancela somente enquanto o pagamento estiver pendente; a transação libera estoque uma vez. Repetir cancelamento é idempotente. Pagamento após cancelamento/expiração vira `payment_exception`; não há cancelamento nem estorno automático de pedido já pago.
+- **Módulos:** domínio/transições; PostgreSQL e reserva/expiração transacionais; API `/v1`; adapter de simulador local + processamento durável; web/BFF server-only; cliente Flutter com capability em armazenamento seguro; operações de loja protegidas.
+- **Ordem vertical:** (1) migration/seed, reserva concorrente, capability e estados; (2) API/simulador, eventos e worker/retirada; (3) web/BFF cliente + fila de loja; (4) Flutter cliente e consulta privada; (5) E2E isolado, documentação e CI.
+- **Critério de conclusão local:** em uma fixture real de PostgreSQL, cliente reserva → simulador confirma → operador prepara/marca pronto → cliente acompanha → retirada ocorre uma vez; pedidos, estoque e processos não usam Ofertas.
+
+- [x] Confirmar linguagem de domínio, atores e estados: catálogo/produto, pedido, preparo, pronto e retirado; definir cancelamento, indisponibilidade e pagamento tardio.
+- [x] Criar backend e schema PostgreSQL próprios, preço autoritativo, reserva de estoque concorrente e autorização server-side para transições.
+- [x] Criar web/BFF e app Flutter próprios; manter secrets fora do browser e credenciais de pedido no armazenamento apropriado do mobile.
+- [x] Implementar worker/outbox somente conforme necessidade comprovada; qualquer confirmação de pagamento deve ser persistida e idempotente.
 - [ ] Criar simulador sem Pix pagável e E2E que cobre concorrência, transições fora de ordem, restart e retirada única.
-- [ ] Adicionar OpenAPI/MCP desta demo sem permitir que ferramenta pule pedido, pagamento ou preparo.
+- [x] Publicar contrato OpenAPI desta demo; a spec não oferece operação que ignore transições do domínio.
+- [ ] Adicionar MCP desta demo sem permitir que ferramenta pule pedido, pagamento ou preparo.
+
+**Progresso de implementação local (09/10/2026):** domínio, backend/API/PostgreSQL, worker durável, simulador local, BFF/web, app Flutter e guia local foram implementados. Testes backend com PostgreSQL real cobrem concorrência, cancelamento/expiração, late payment, restart do store/evento e retirada única; web tem validações unitárias e Flutter testes de API/widget. Ainda não concluir esta demo: falta smoke/E2E repetível integrando servidor + BFF/browser + app/dispositivo, pipeline CI dessa demo, contrato OpenAPI/MCP e revisão/validação dos limites operacionais. iOS/Keychain e PSP continuam bloqueados por plataforma/autorização; não integram o aceite local.
 
 **Aceite:** uma fixture local percorre pedido → preparo → pronto → retirada exatamente uma vez em cada cliente; seu banco, processos e testes não dependem do schema de Ofertas.
 
 ## 5. Reservas — demo vertical independente
 
-- [ ] Definir domínio de recursos, duração, intervalos, buffers, fuso IANA, horário de verão, hold, expiração, cancelamento e política de atraso.
-- [ ] Criar backend/schema próprios que previnam overlap/duplo booking no banco, inclusive chamadas concorrentes e slots adjacentes.
-- [ ] Construir disponibilidade e reserva em web/BFF e Flutter; backend calcula preço e janela disponível, clientes não decidem horário elegível.
-- [ ] Separar estados de reserva e pagamento; definir o efeito de pagamento tardio após liberação do slot sem reassociar silenciosamente a outra reserva.
-- [ ] Implementar expiração/reconciliação e simulador local; integrar PSP somente depois de contrato merchant autorizado.
-- [ ] Criar testes de mesma janela concorrente, adjacência, timezone/DST, timeout, expiração, late paid e restart; adicionar OpenAPI/MCP restrito a horários elegíveis.
+- **Base MVP didática registrada (09/10/2026; não é política comercial):** um recurso seedado, “Sala de atendimento”; sessão de 30 min, buffer de 15 min, grade de início a cada 15 min; seg–sex 09:00–17:00 em `America/Sao_Paulo`; disponibilidade até 14 dias; hold de 5 min; preço de seed R$ 120,00 controlado pelo backend. Sem feriados, múltiplos recursos ou refund automático.
+- **Atores/jornadas:** cliente lista horários autoritativos → adquire hold atomicamente → usa capability privada para consultar, confirmar simulação local ou cancelar enquanto held; worker confirma evento, expira hold e marca pagamentos tardios como exceção; operador local pode consultar reservas pagas e marcar conclusão, sem representar identidade de produção.
+- **Estados independentes:** reserva `held → confirmed → completed`, ou `held → expired/cancelled`; pagamento `pending → paid/expired/cancelled/payment_exception`. Pagamento depois da liberação não readquire horário nem troca a reserva de outro cliente.
+- **Fuso/DST:** instantes wire em RFC3339/UTC; resposta inclui offset/local label e IANA zone. Enumerar instantes pela linha do tempo UTC para cada dia local, omitir horários inexistentes e distinguir ocorrências repetidas no fold. Cliente só pode submeter start retornado e backend sempre recalcula elegibilidade.
+- **Concorrência:** Postgres é árbitro final com exclusion constraint para intervalo ocupado `[starts_at, ends_at + buffer)` em holds/confirmadas; slots adjacentes são válidos quando intervalo ocupado anterior termina no instante em que o seguinte começa. Hold e pagamento são gravados transacionalmente; expiração libera exatamente uma vez.
+- **Módulos/rotas:** agenda/serviço e projeção de disponibilidade; store/transições; API `/v1`; simulador local + worker/outbox; BFF web com cookie HttpOnly; Flutter com credenciais em secure storage; operador local separado.
+- **Sequência vertical:** (1) migrations/seed/timezone/gerador de slots/exclusion + reservas concorrentes; (2) capabilities, cancelamento, simulador, evento/worker/expiração/reconciliação; (3) HTTP/OpenAPI e web/BFF jornada cliente; (4) Flutter jornada cliente; (5) operador/retirada de manutenção, E2E Chromium + Android físico e CI/docs.
+- [x] Validar base do domínio e implementar geração de disponibilidade, DST, holds, buffers e políticas acima.
+- [x] Criar backend/schema próprios que previnam overlap/duplo booking no banco, inclusive chamadas concorrentes e slots adjacentes.
+- [x] Construir disponibilidade e reserva em web/BFF e Flutter; backend calcula preço e janela disponível, clientes não decidem horário elegível.
+- [x] Separar estados de reserva e pagamento; definir o efeito de pagamento tardio após liberação do slot sem reassociar silenciosamente a outra reserva.
+- [x] Implementar expiração/reconciliação e simulador local; integrar PSP somente depois de contrato merchant autorizado.
+- [x] Criar testes de mesma janela concorrente, adjacência, timezone/DST, timeout, expiração, late paid e restart; contrato OpenAPI restrito a horários elegíveis.
+- [ ] Adicionar MCP restrito ao domínio; MCP ainda não existe neste repositório.
+
+**Progresso local (10/10/2026):** backend Go/PostgreSQL, BFF/customer+operator web, Flutter, OpenAPI, Scalar, documentação e CI próprios foram implementados. PostgreSQL real `-race -count=3` cobre 20 hold concorrentes, intervalos adjacentes/conflitantes, capability/cancelamento, expiração, pagamento tardio, recuperação de evento após pool restart, migration idempotente e HTTP/auth/operator. Chromium E2E passou com Postgres/schema efêmero e processos API+BFF; também verifica Scalar renderizando o contrato OpenAPI canônico. Android físico Samsung SM-A146M passou em jornada local de hold/cancelamento com secure storage e adb reverse. Web format/lint/check/build/audit, Flutter analyze/test/APK e tooling Ruff passaram. Pendem revisão de limites/ameaças, MCP, CI hosted, validação iOS/Keychain em macOS e roteiro integrado das três demos. Não é autorização para PSP ou deploy.
 
 **Aceite:** banco garante ausência de reservas sobrepostas sob concorrência real; horários e transições permanecem corretos ao reiniciar API/worker e atravessar mudanças de fuso.
 

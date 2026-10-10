@@ -26,10 +26,37 @@ Este arquivo distingue implementação, testes automatizados e validação exter
 - [x] Worker independente de eventos/expiração para a demo ofertas; validação PostgreSQL e smoke de processos separados.
 - [ ] OpenAPI completo e CI reproduzível por todas as demos. CI hosted de ofertas passou no commit `1e4af23`; revisões locais ainda não publicadas.
 
+## Click & collect
+
+- [x] Backend Go e PostgreSQL independentes, seed, ledger de migrations, preço autoritativo e reserva concorrente sem oversell.
+- [x] Capability de pedido/código de retirada armazenados como hash no backend; acesso da web em cookie HttpOnly por pedido e mobile em Flutter Secure Storage.
+- [x] Cancelamento pendente idempotente, expiração em lote, evento/cobrança local duráveis, worker após restart e exceção para confirmação tardia sem reabrir estoque/retirada.
+- [x] Web/BFF e painel local da loja; Flutter cliente local; pagamento sintético explícito, sem payload Pix/PSP.
+- [x] Contrato OpenAPI estático em `click-collect/backend/openapi.yaml`; documentação e roteiro independentes em `click-collect/README.md`, `click-collect/backend/README.md` e `docs/click-collect-local.md`.
+- [x] Testes PostgreSQL `-race -count=5`, HTTP/worker, browser Chromium duas execuções sequenciais e Flutter analyze/test/APK debug.
+- [ ] Hosted CI destas alterações ainda não observado; iOS/Keychain requer macOS.
+- [ ] MCP, autenticação humana de produção, recuperação/rate limit, observabilidade/backups e revisão operacional ainda pendentes. A demo local não é sistema de loja real.
+
+Validação final local desta fatia: Go `-race -count=5` contra PostgreSQL real; Browser Chromium + API Go + worker + DB real passou duas execuções consecutivas, cada uma em schema efêmero. Web: format, check (0 warnings), lint, 4 testes, build e audit passaram. Flutter: format, analyze, 5 testes e APK debug passaram; teste de integração `flutter drive` passou em aparelho físico Samsung SM-A146M (Android 15), com PostgreSQL descartável, servidor loopback e `adb reverse` temporário. O primeiro ciclo identificou que a fixture não rolava até controles fora da viewport e que `go run` órfão mantinha listener antigo; fixture foi corrigida para rolar e aguardar renderização, e repetição com binário gerenciado terminou verde. Tooling Python: Ruff/format, compileall e 9 testes passaram. Contrato OpenAPI mantido no repositório; actionlint no workflow passou; `git diff --check` passou. O emulador continuou indisponível (`-6`), mas o aparelho físico validou o fluxo. Nenhuma CI hosted foi disparada, pois não houve push/commit.
+
 ## Outras demos
 
-- [ ] Click & collect: backend/banco/web/mobile independentes, preparo e retirada.
-- [ ] Reservas: backend/banco/web/mobile independentes, agenda/slots/timezone.
+### Reservas
+
+- [x] Backend Go e PostgreSQL independentes; agenda em fuso IANA, disponibilidade 14 dias, resource seedado e preço autoritativo.
+- [x] Exclusion constraint GiST para intervalo ocupado com buffer, criação transacional de hold/pagamento sintético, capabilities privadas armazenadas como hash.
+- [x] Worker persistente para evento pago e expiração; pagamento após deadline vira `payment_exception`, mesmo se o worker de expiração ainda não marcou a reserva, sem reabrir/reivindicar slot.
+- [x] API HTTP `/v1`, autenticação separada de capability/operator/simulator, contrato OpenAPI canônico e referência Scalar em `/api-reference`.
+- [x] Web/BFF cliente e operador local; cookie HttpOnly path-scoped e segredos de operador/simulador server-only.
+- [x] Flutter próprio com `flutter_secure_storage`, sem retry automático de POST com resultado incerto; cleartext Android limitado a loopback.
+- [x] Go/PostgreSQL `-race -p=1 -count=3`, vet e build; cobertura concorrência, adjacência, falha tardia, cancelamento, capability, restart de pool e migration repetida.
+- [x] Chromium E2E contra Postgres real/schema isolado: Scalar renderiza o OpenAPI canônico; agenda → hold → evento sintético → worker → operador.
+- [x] Web format/lint/check/build/audit; Flutter format/analyze/4 testes/APK debug; timeout móvel validado como resultado incerto sem retry; Ruff/compile do runner.
+- [ ] MCP da demo, threat review ampliada, CI hosted observada e validação iOS/Keychain em macOS.
+
+Validação local Reservas: Chromium passou (2 testes) em schema PostgreSQL efêmero; browser E2E confirmou Scalar renderizando o OpenAPI canônico servido em `/openapi.yaml` e a jornada de reserva. Android físico Samsung SM-A146M/Android 15 passou a jornada de hold privado e cancelamento usando PostgreSQL/API temporários, secure storage e `adb reverse` removido no cleanup. A suíte Go `-race -p=1 -count=3`, vet, build e golangci-lint passou novamente após a regressão de pagamento após deadline; web format/lint/check/build e `npm audit --audit-level=high`, Flutter format/analyze/test/APK e Ruff/compile do runner passaram. A auditoria ainda reporta seis advisories de baixa severidade em dependências transitivas do Scalar. Hosted CI não foi disparada. O aviso `adapter-auto` informa que não há target de deploy configurado — consistente com a restrição loopback, sem implantação autorizada.
+
+Scalar é carregado sob demanda somente na rota `/api-reference`; a geração do build ainda reporta um chunk grande nessa rota. A versão fixada mantém seis advisories `low` transitivos de AI chat; o gate configurado em `high` passa.
 
 ## Documentação e validação
 

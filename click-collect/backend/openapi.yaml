@@ -1,0 +1,343 @@
+openapi: 3.1.0
+info:
+  title: Balcão Click & collect local API
+  version: 1.0.0
+  description: >-
+    API local exclusiva da demonstração. Não cria Pix, não chama Woovi ou PSP e
+    não deve ser exposta em rede. Pagamento simulado não movimenta dinheiro.
+servers:
+  - url: http://127.0.0.1:8082
+    description: Processo local loopback-only
+security: []
+tags:
+  - name: Catalog
+    description: Local catalog and availability.
+  - name: Customer orders
+    description: Customer operations requiring the per-order capability.
+  - name: Local simulator
+    description: Synthetic-only operations; no payment provider is called.
+  - name: Store operator
+    description: Local demo operator queue and fulfillment transitions.
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      summary: Check local API and PostgreSQL health
+      responses:
+        '204': { description: Healthy }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/products:
+    get:
+      tags: [Catalog]
+      operationId: listProducts
+      summary: List the local demo catalog
+      responses:
+        '200':
+          description: Bounded catalog with current available stock
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Product' }
+        '500': { $ref: '#/components/responses/UnexpectedError' }
+  /v1/orders:
+    post:
+      tags: [Customer orders]
+      operationId: reserveOrder
+      summary: Reserve exactly one available unit
+      description: >-
+        Price and TTL are read from the database. The response contains the
+        order capability and pickup code exactly once; clients must save them
+        securely. A timed-out response has an uncertain outcome and must not
+        trigger an automatic second reservation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [product_id]
+              properties:
+                product_id: { type: string, example: house-cake }
+      responses:
+        '201':
+          description: Reservation created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReservedOrder' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/ProductNotFound' }
+        '409': { $ref: '#/components/responses/ProductUnavailable' }
+        '500': { $ref: '#/components/responses/UnexpectedError' }
+  /v1/orders/{order_id}:
+    parameters:
+      - $ref: '#/components/parameters/OrderID'
+    get:
+      tags: [Customer orders]
+      operationId: getOrder
+      summary: Get an order using its private capability
+      security: [{ orderCapability: [] }]
+      responses:
+        '200':
+          description: Authorized order
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/OrderAccessRequired' }
+        '404': { $ref: '#/components/responses/OrderNotFound' }
+        '500': { $ref: '#/components/responses/UnexpectedError' }
+    delete:
+      tags: [Customer orders]
+      operationId: cancelOrder
+      summary: Cancel a pending reservation and release its unit once
+      security: [{ orderCapability: [] }]
+      responses:
+        '200':
+          description: Cancelled order; repeating a cancellation is idempotent
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/OrderAccessRequired' }
+        '404': { $ref: '#/components/responses/OrderNotFound' }
+        '409': { $ref: '#/components/responses/OrderConflict' }
+        '500': { $ref: '#/components/responses/UnexpectedError' }
+  /v1/orders/{order_id}/demo-payment:
+    parameters:
+      - $ref: '#/components/parameters/OrderID'
+    post:
+      tags: [Local simulator]
+      operationId: simulateCustomerPayment
+      summary: Persist an idempotent local synthetic payment event
+      description: Does not create a payable Pix payload or contact a financial institution.
+      security: [{ orderCapability: [] }]
+      responses:
+        '202': { description: Synthetic payment event accepted for asynchronous processing }
+        '401': { $ref: '#/components/responses/OrderAccessRequired' }
+        '404': { $ref: '#/components/responses/OrderNotFound' }
+        '409': { $ref: '#/components/responses/OrderConflict' }
+        '500': { $ref: '#/components/responses/UnexpectedError' }
+  /v1/simulator/orders/{order_id}/charge:
+    parameters:
+      - $ref: '#/components/parameters/OrderID'
+    post:
+      tags: [Local simulator]
+      operationId: createSimulatedCharge
+      summary: Create a synthetic charge record at the authoritative order price
+      security: [{ simulatorToken: [] }]
+      responses:
+        '201':
+          description: Existing synthetic charge for this order (repeated calls are idempotent)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Charge' }
+        '401': { $ref: '#/components/responses/SimulatorAccessRequired' }
+        '404': { $ref: '#/components/responses/OrderNotFound' }
+        '409': { $ref: '#/components/responses/OrderConflict' }
+        '500': { $ref: '#/components/responses/UnexpectedError' }
+  /v1/simulator/orders/{order_id}/confirm:
+    parameters:
+      - $ref: '#/components/parameters/OrderID'
+    post:
+      tags: [Local simulator]
+      operationId: confirmSimulatedCharge
+      summary: Persist an idempotent synthetic payment event
+      security: [{ simulatorToken: [] }]
+      responses:
+        '202': { description: Synthetic event persisted for the local worker }
+        '401': { $ref: '#/components/responses/SimulatorAccessRequired' }
+        '404': { $ref: '#/components/responses/OrderNotFound' }
+        '500': { $ref: '#/components/responses/UnexpectedError' }
+  /v1/operator/orders:
+    get:
+      tags: [Store operator]
+      operationId: listOperatorOrders
+      summary: Read the bounded local store order queue
+      security: [{ operatorToken: [] }]
+      responses:
+        '200':
+          description: Paid orders visible to the local operator
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/OperatorAccessRequired' }
+        '500': { $ref: '#/components/responses/UnexpectedError' }
+  /v1/operator/orders/{order_id}/ready:
+    parameters:
+      - $ref: '#/components/parameters/OrderID'
+    post:
+      tags: [Store operator]
+      operationId: markOrderReady
+      summary: Mark a paid order ready after preparation
+      security: [{ operatorToken: [] }]
+      responses:
+        '200':
+          description: Order is ready for pickup
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/OperatorAccessRequired' }
+        '404': { $ref: '#/components/responses/OrderNotFound' }
+        '409': { $ref: '#/components/responses/OrderConflict' }
+        '500': { $ref: '#/components/responses/UnexpectedError' }
+  /v1/operator/orders/{order_id}/pickup:
+    parameters:
+      - $ref: '#/components/parameters/OrderID'
+    post:
+      tags: [Store operator]
+      operationId: redeemPickup
+      summary: Verify and consume a ready order pickup code exactly once
+      security: [{ operatorToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [pickup_code]
+              properties:
+                pickup_code: { type: string, pattern: '^[A-Fa-f0-9]{8}$' }
+      responses:
+        '200':
+          description: Pickup consumed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/OperatorAccessRequired' }
+        '403': { $ref: '#/components/responses/PickupCodeInvalid' }
+        '404': { $ref: '#/components/responses/OrderNotFound' }
+        '409': { $ref: '#/components/responses/OrderConflict' }
+        '500': { $ref: '#/components/responses/UnexpectedError' }
+components:
+  parameters:
+    OrderID:
+      name: order_id
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[a-f0-9]{32}$' }
+  securitySchemes:
+    orderCapability:
+      type: http
+      scheme: bearer
+      description: Opaque per-order capability returned only by POST /v1/orders; ID alone grants no access.
+    operatorToken:
+      type: apiKey
+      in: header
+      name: X-Demo-Token
+      description: Local demo operator secret; not human authentication.
+    simulatorToken:
+      type: apiKey
+      in: header
+      name: X-Demo-Token
+      description: Local demo simulator secret; not PSP credentials.
+  schemas:
+    Product:
+      type: object
+      required: [id, title, description, price_cents, available_units, reservation_ttl_seconds]
+      properties:
+        id: { type: string, example: house-cake }
+        title: { type: string }
+        description: { type: string }
+        price_cents: { type: integer, minimum: 1 }
+        available_units: { type: integer, minimum: 0 }
+        reservation_ttl_seconds: { type: integer, minimum: 1 }
+    Order:
+      type: object
+      required: [id, product_id, product_title, amount_cents, payment_state, fulfillment_state, expires_at, created_at]
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        product_id: { type: string }
+        product_title: { type: string }
+        amount_cents: { type: integer, minimum: 1 }
+        payment_state:
+          type: string
+          enum: [pending, paid, expired, cancelled, payment_exception]
+        fulfillment_state:
+          type: string
+          enum: [awaiting_payment, preparing, ready_for_pickup, picked_up]
+        expires_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        picked_up_at: { type: string, format: date-time }
+    ReservedOrder:
+      allOf:
+        - $ref: '#/components/schemas/Order'
+        - type: object
+          required: [order_access_token, pickup_code]
+          properties:
+            order_access_token: { type: string, pattern: '^[a-f0-9]{64}$' }
+            pickup_code: { type: string, pattern: '^[A-F0-9]{8}$' }
+    Charge:
+      type: object
+      required: [id, order_id, amount_cents, status, payment_state]
+      properties:
+        id: { type: string }
+        order_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        amount_cents: { type: integer, minimum: 1 }
+        status: { type: string, enum: [pending, paid] }
+        payment_state: { type: string, enum: [pending] }
+    Error:
+      type: object
+      required: [message, error_code]
+      properties:
+        message: { type: string }
+        error_code: { type: string, pattern: '^[A-Z][A-Z0-9_]*$' }
+  responses:
+    BadRequest:
+      description: Malformed JSON or field shape
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ProductNotFound:
+      description: Product not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ProductUnavailable:
+      description: No stock available
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    OrderAccessRequired:
+      description: Order capability required
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    OrderNotFound:
+      description: Order not found or capability not authorized
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    OrderConflict:
+      description: Order transition or pickup is not permitted in its current state
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    PickupCodeInvalid:
+      description: Pickup code is invalid
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    OperatorAccessRequired:
+      description: Local operator token required
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    SimulatorAccessRequired:
+      description: Local simulator token required
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    UnexpectedError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unavailable:
+      description: Service unavailable
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }

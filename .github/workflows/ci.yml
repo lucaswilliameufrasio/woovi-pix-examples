@@ -14,6 +14,193 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  click-collect-backend:
+    name: Click & collect Go and PostgreSQL
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18.6-alpine
+        env:
+          POSTGRES_USER: click_collect_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: click_collect_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U click_collect_test -d click_collect_test"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://click_collect_test@127.0.0.1:5432/click_collect_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v5
+      - name: Check Go formatting
+        working-directory: click-collect/backend
+        run: test -z "$(gofmt -l .)"
+      - name: Test with PostgreSQL and race detector
+        working-directory: click-collect/backend
+        run: mise exec -- go test -race -p=1 -count=3 ./...
+      - name: Build and vet
+        working-directory: click-collect/backend
+        run: |
+          mise exec -- go build ./...
+          mise exec -- go vet ./...
+      - name: Lint
+        working-directory: click-collect/backend
+        run: mise exec -- go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0 run
+  click-collect-web:
+    name: Click & collect SvelteKit web
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v5
+      - name: Install dependencies
+        working-directory: click-collect/web
+        run: mise exec -- npm ci
+      - name: Format, lint, typecheck, and unit tests
+        working-directory: click-collect/web
+        run: |
+          mise exec -- npm run format:check
+          mise exec -- npm run lint
+          mise exec -- npm run check
+          mise exec -- npm test
+      - name: Production build and dependency audit
+        working-directory: click-collect/web
+        run: |
+          mise exec -- npm run build
+          mise exec -- npm audit --audit-level=high
+
+  click-collect-browser-e2e:
+    name: Click & collect browser E2E
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18.6-alpine
+        env:
+          POSTGRES_USER: click_collect_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: click_collect_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U click_collect_test -d click_collect_test"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://click_collect_test@127.0.0.1:5432/click_collect_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v5
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y postgresql-client
+      - name: Install web dependencies
+        working-directory: click-collect/web
+        run: mise exec -- npm ci
+      - name: Install Chromium and OS dependencies
+        working-directory: click-collect/web
+        run: mise exec -- npx --no-install playwright install --with-deps chromium
+      - name: Run isolated browser journey twice
+        run: python3 tooling/run_click_collect_smoke.py --browser
+
+  click-collect-mobile:
+    name: Click & collect Flutter analyze, tests, and Android build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v5
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.6"
+          channel: stable
+          cache: true
+      - name: Install FVM
+        run: |
+          dart pub global activate fvm
+          echo "$HOME/.pub-cache/bin" >> "$GITHUB_PATH"
+      - name: Resolve dependencies, format, analyze, and test
+        working-directory: click-collect/mobile
+        run: |
+          fvm install
+          fvm flutter pub get
+          fvm dart format --output=none --set-exit-if-changed lib test integration_test
+          fvm flutter analyze
+          fvm flutter test
+      - name: Build Android debug APK
+        working-directory: click-collect/mobile
+        run: fvm flutter build apk --debug
+
+  click-collect-android-e2e:
+    name: Click & collect Android customer E2E
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18.6-alpine
+        env:
+          POSTGRES_USER: click_collect_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: click_collect_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U click_collect_test -d click_collect_test"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://click_collect_test@127.0.0.1:5432/click_collect_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v5
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.6"
+          channel: stable
+          cache: true
+      - name: Install FVM and resolve app dependencies
+        working-directory: click-collect/mobile
+        run: |
+          dart pub global activate fvm
+          echo "$HOME/.pub-cache/bin" >> "$GITHUB_PATH"
+          fvm install
+          fvm flutter pub get
+          fvm dart format --output=none --set-exit-if-changed lib test integration_test
+      - name: Start API and durable local simulator
+        run: |
+          export DATABASE_URL="$TEST_DATABASE_URL"
+          export DEMO_OPERATOR_TOKEN="$(openssl rand -hex 32)"
+          export DEMO_SIMULATOR_TOKEN="$(openssl rand -hex 32)"
+          export LISTEN_ADDR=127.0.0.1:8082
+          nohup mise exec -- go run ./cmd/server > "$RUNNER_TEMP/click-collect-api.log" 2>&1 < /dev/null &
+          echo "$!" > "$RUNNER_TEMP/click-collect-api.pid"
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:8082/healthz >/dev/null; then exit 0; fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/click-collect-api.log"
+          exit 1
+        working-directory: click-collect/backend
+      - name: Run Android E2E on a local emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          profile: pixel_6
+          script: >-
+            cd click-collect/mobile &&
+            fvm flutter drive --driver=test_driver/integration_test.dart
+            --target=integration_test/app_test.dart
+            -d emulator-5554
+            --dart-define=API_BASE_URL=http://10.0.2.2:8082
+      - name: Stop local API
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/click-collect-api.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/click-collect-api.pid")" 2>/dev/null || true
+          fi
+
   backend:
     name: Go and PostgreSQL
     runs-on: ubuntu-24.04
@@ -157,3 +344,114 @@ jobs:
       - name: Stop PostgreSQL without deleting its volume
         if: always()
         run: docker compose -p "$SMOKE_COMPOSE_PROJECT" -f ofertas-relampago/backend/compose.yaml stop postgres
+
+  reservations-backend:
+    name: Reservations Go and PostgreSQL
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18.6-alpine
+        env:
+          POSTGRES_USER: reservations_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: reservations_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U reservations_test -d reservations_test"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://reservations_test@127.0.0.1:5432/reservations_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v5
+      - name: Check Go formatting
+        working-directory: reservas/backend
+        run: test -z "$(gofmt -l .)"
+      - name: PostgreSQL integration, concurrency, and race tests
+        working-directory: reservas/backend
+        run: mise exec -- go test -race -p=1 -count=3 ./...
+      - name: Build, vet, and lint
+        working-directory: reservas/backend
+        run: |
+          mise exec -- go build ./...
+          mise exec -- go vet ./...
+          mise exec -- go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0 run
+  reservations-web:
+    name: Reservations SvelteKit web
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v5
+      - name: Install web dependencies
+        working-directory: reservas/web
+        run: mise exec -- npm ci
+      - name: Format, lint, and typecheck
+        working-directory: reservas/web
+        run: |
+          mise exec -- npm run format:check
+          mise exec -- npm run lint
+          mise exec -- npm run check
+      - name: Build and audit dependencies
+        working-directory: reservas/web
+        run: |
+          mise exec -- npm run build
+          mise exec -- npm audit --audit-level=high
+
+  reservations-mobile:
+    name: Reservations Flutter analyze, tests, and Android build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v5
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.6"
+          channel: stable
+          cache: true
+      - name: Install FVM and resolve dependencies
+        working-directory: reservas/mobile
+        run: |
+          dart pub global activate fvm
+          echo "$HOME/.pub-cache/bin" >> "$GITHUB_PATH"
+          fvm install
+          fvm flutter pub get
+          fvm dart format --output=none --set-exit-if-changed lib test integration_test test_driver
+          fvm flutter analyze
+          fvm flutter test
+          fvm flutter build apk --debug
+
+  reservations-browser-e2e:
+    name: Reservations Chromium E2E against PostgreSQL
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18.6-alpine
+        env:
+          POSTGRES_USER: reservations_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: reservations_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U reservations_test -d reservations_test"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://reservations_test@127.0.0.1:5432/reservations_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v5
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y postgresql-client
+      - name: Install web dependencies
+        working-directory: reservas/web
+        run: mise exec -- npm ci
+      - name: Install Chromium
+        working-directory: reservas/web
+        run: mise exec -- npx --no-install playwright install --with-deps chromium
+      - name: Run isolated browser journey
+        run: python3 tooling/run_reservations_smoke.py
